@@ -4,11 +4,14 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
+  workflow_dispatch: # 支持网页端手动点击一键发布
 
 jobs:
   build:
     runs-on: windows-latest
+
+    permissions:
+      contents: write # 确保拥有创建 Release 和上传文件的写入权限
 
     steps:
       - name: Checkout Code
@@ -31,10 +34,27 @@ jobs:
         run: |
           go build -ldflags="-H windowsgui -s -w" -o DareuAE6V2Tray.exe .
 
+      # 生成动态版本标签（如果是手动触发，自动使用当前日期作为版本号）
+      - name: Generate Release Tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "release_tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "release_tag=v$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: "达尔优 AE6 V2 托盘助手 ${{ steps.tag.outputs.release_tag }}"
+          body: |
+            ### 达尔优 AE6 V2 电量监控小工具
+            - 自动编译生成的免安装单文件绿色版。
+            - 下载后直接双击运行，常驻桌面右下角系统托盘。
+            - 支持低电量弹窗提醒与开机自启动设置。
           files: DareuAE6V2Tray.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
