@@ -26,15 +26,20 @@ jobs:
         run: |
           go get github.com/getlantern/systray
           go get github.com/karalabe/hid
+          go get golang.org/x/sys/windows
           go get golang.org/x/sys/windows/registry
           go get gopkg.in/toast.v1
-          go install github.com/tc-hib/go-winres@latest
+          go install github.com/akavel/rsrc@latest
           go mod tidy
 
-      # 生成精美的 Windows EXE 图标资源
-      - name: Generate Windows Icon Resource
+      # 下载精美游戏鼠标图标并嵌入 EXE 文件头
+      - name: Embed Custom App Icon
+        shell: bash
         run: |
-          go-winres simply --icon https://raw.githubusercontent.com/feathericons/feather/master/icons/mouse-pointer.png || true
+          curl -sL -o app.ico https://raw.githubusercontent.com/runelite/runelite/master/runelite-client/src/main/resources/net/runelite/client/ui/runelite.ico || true
+          if [ -f app.ico ]; then
+            rsrc -ico app.ico -o rsrc.syso
+          fi
 
       - name: Build Windows Binary
         run: |
@@ -57,8 +62,9 @@ jobs:
           name: "达尔优 AE6 V2 托盘助手 ${{ steps.tag.outputs.release_tag }}"
           body: |
             ### 达尔优 AE6 V2 电量监控小工具
-            - 嵌入原生桌面图标，告别白框默认文件[cite: 23]。
-            - 增强 HID 通信侦测能力，优化充电与电量识别。
+            - 嵌入原生精美图标[cite: 23]。
+            - 增强达尔优全系 PID 与心跳探测协议[cite: 4, 6]。
+            - 新增右键诊断排查日志功能。
           files: DareuAE6V2Tray.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
