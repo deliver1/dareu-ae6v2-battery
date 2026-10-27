@@ -32,8 +32,8 @@ const (
 )
 
 var CandidatePIDs = []uint16{
-	0x1261,
-	0x1260,
+	0x1261, // 2.4G 接收器
+	0x1260, // 有线模式
 	0x04ED,
 	0x0260,
 	0x0001,
@@ -69,16 +69,12 @@ func getLog() string {
 }
 
 func main() {
-	defer func() {
-		_ = recover()
-	}()
+	defer func() { _ = recover() }()
 	systray.Run(onReady, onExit)
 }
 
 func onReady() {
-	defer func() {
-		_ = recover()
-	}()
+	defer func() { _ = recover() }()
 
 	systray.SetTitle("达尔优 AE6 V2")
 	systray.SetIcon(createCleanBatteryIco(-1, false, false))
@@ -107,7 +103,6 @@ func handleMenuEvents() {
 	for {
 		select {
 		case <-mDebug.ClickedCh:
-			// 点击后在桌面生成一个简单的 txt 文件，绝不调用任何易闪退的弹窗 API
 			go exportDebugFile()
 		case <-mAutoStart.ClickedCh:
 			current := mAutoStart.Checked()
@@ -134,8 +129,6 @@ func exportDebugFile() {
 	}
 	desktopPath := filepath.Join(home, "Desktop", "dareu_debug.txt")
 	_ = os.WriteFile(desktopPath, []byte(getLog()), 0644)
-
-	// 使用系统自带记事本安全打开
 	_ = exec.Command("notepad.exe", desktopPath).Start()
 }
 
@@ -152,9 +145,7 @@ func pollingLoop() {
 }
 
 func updateBatteryState() {
-	defer func() {
-		_ = recover()
-	}()
+	defer func() { _ = recover() }()
 
 	state := fetchMouseState()
 
@@ -180,7 +171,7 @@ func updateBatteryState() {
 		}
 	} else {
 		systray.SetTooltip("未连接 · AE6 V2")
-		mStatus.SetTitle("状态: 接收器未连接/被占用")
+		mStatus.SetTitle("状态: 接收器未连接/无数据")
 		systray.SetIcon(createCleanBatteryIco(-1, false, false))
 	}
 }
@@ -228,9 +219,7 @@ func setAutoStart(enable bool) error {
 }
 
 func fetchMouseState() MouseState {
-	defer func() {
-		_ = recover()
-	}()
+	defer func() { _ = recover() }()
 
 	var matchedDevices []hid.DeviceInfo
 
@@ -262,17 +251,18 @@ func fetchMouseState() MouseState {
 			continue
 		}
 
-		// 发送达尔优 WebHID 原版握手指令序列
-		cmd1 := make([]byte, 65)
-		cmd1[0] = ReportID
-		cmd1[1] = 0x08
-		cmd1[2] = 0x02
-		_, _ = dev.Write(cmd1)
+		// 达尔优专用唤醒矩阵：组合发送 Feature / Output 指令
+		// 指令 1: 0x08 0x02 触发状态上报
+		pkt1 := make([]byte, 65)
+		pkt1[0] = 0x08
+		pkt1[1] = 0x02
+		_, _ = dev.Write(pkt1)
 
-		cmd2 := make([]byte, 65)
-		cmd2[0] = ReportID
-		cmd2[1] = 0x03
-		_, _ = dev.Write(cmd2)
+		// 指令 2: 0x07 / 0x04 辅助触发指令
+		pkt2 := make([]byte, 65)
+		pkt2[0] = 0x08
+		pkt2[1] = 0x08
+		_, _ = dev.Write(pkt2)
 
 		buf := make([]byte, 256)
 		readCh := make(chan int, 1)
@@ -285,14 +275,14 @@ func fetchMouseState() MouseState {
 		var n int
 		select {
 		case n = <-readCh:
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(120 * time.Millisecond):
 			n = 0
 		}
 		dev.Close()
 
 		if n > 0 {
 			var hexParts []string
-			limit := 32
+			limit := 24
 			if n < limit {
 				limit = n
 			}
@@ -305,9 +295,11 @@ func fetchMouseState() MouseState {
 			var batVal int = -1
 			var isCharging bool = false
 
+			// 优先检查固定偏移
 			if n > BatteryByteIdx && buf[BatteryByteIdx] > 0 && buf[BatteryByteIdx] <= 100 {
 				batVal = int(buf[BatteryByteIdx])
 			} else {
+				// 启发式搜索有效百分比
 				for i := 1; i < n; i++ {
 					if buf[i] >= 10 && buf[i] <= 100 {
 						batVal = int(buf[i])
@@ -316,19 +308,18 @@ func fetchMouseState() MouseState {
 				}
 			}
 
+			// 充电状态探测
 			if n > BatteryByteIdx+1 && (buf[BatteryByteIdx+1] == 1 || buf[BatteryByteIdx+1] == 2) {
 				isCharging = true
 			}
-			if n > 3 && (buf[1] == 0x02 || buf[2] == 0x01 || buf[3] == 0x01) {
-				isCharging = true
-			}
-			if devInfo.ProductID == 0x1260 {
+			// 某些固件下的充电状态在第 1 或第 2 字节
+			if n > 2 && (buf[1] == 0x01 || buf[2] == 0x01 || buf[1] == 0x02) {
 				isCharging = true
 			}
 
 			if batVal > 0 {
 				lastBattery = batVal
-				setLog(fmt.Sprintf("读取成功!\nPID:0x%04X 电量:%d%% 充电:%v\n原始前段: %s", devInfo.ProductID, batVal, isCharging, hexStr))
+				setLog(fmt.Sprintf("读取成功!\nPID:0x%04X 电量:%d%% 充电:%v\n前段字节: %s", devInfo.ProductID, batVal, isCharging, hexStr))
 				return MouseState{
 					Battery:    batVal,
 					IsCharging: isCharging,
