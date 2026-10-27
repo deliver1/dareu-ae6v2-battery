@@ -9,9 +9,7 @@ import (
 	"image/draw"
 	"image/png"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,17 +21,17 @@ import (
 
 const (
 	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)
-	ReportID        byte   = 0x08   // 抓包确认 ReportId 严格为 8
-	PollingInterval        = 8 * time.Second
+	ReportID        byte   = 0x08   // 抓包确认 ReportID 8
+	PollingInterval        = 5 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
 	LowBattery = 15
 )
 
 var CandidatePIDs = []uint16{
-	0x1261, // 接收器
+	0x1261, // 2.4G 接收器
 	0x04ED, // 十进制 1261
-	0x1260, // 有线模式
+	0x1260, // 鼠标本体直连
 }
 
 type MouseState struct {
@@ -44,28 +42,13 @@ type MouseState struct {
 
 var (
 	mStatus     *systray.MenuItem
-	mDebug      *systray.MenuItem
+	mRefresh    *systray.MenuItem
 	mAutoStart  *systray.MenuItem
 	mQuit       *systray.MenuItem
 	hasNotified bool
 	lastBattery int = -1
-	lastLog     string = "就绪，等待获取数据..."
-	logMu       sync.Mutex
-	isScanning  bool
 	scanMu      sync.Mutex
 )
-
-func setLog(msg string) {
-	logMu.Lock()
-	defer logMu.Unlock()
-	lastLog = fmt.Sprintf("[%s]\n%s", time.Now().Format("15:04:05"), msg)
-}
-
-func getLog() string {
-	logMu.Lock()
-	defer logMu.Unlock()
-	return lastLog
-}
 
 func main() {
 	defer func() { _ = recover() }()
@@ -77,20 +60,28 @@ func onReady() {
 
 	systray.SetTitle("达尔优 AE6 V2")
 	systray.SetIcon(createCleanBatteryIco(-1, false, false))
-	systray.SetTooltip("达尔优 AE6 V2: 侦测中...")
+	systray.SetTooltip("达尔优 AE6 V2: 正在侦测...")
 
+	// 1. 状态显示项（纯文本，点击不触发任何破坏性消息泵）
 	mStatus = systray.AddMenuItem("状态: 读取中...", "当前电量状态")
 	mStatus.Disable()
 
 	systray.AddSeparator()
 
-	mDebug = systray.AddMenuItem("导出排查日志到桌面", "生成 dareu_debug.txt 查看数据")
+	// 2. 手动刷新
+	mRefresh = systray.AddMenuItem("立即刷新电量", "重新扫描达尔优接收器")
 
-	mAutoStart = systray.AddMenuItemCheckbox("开机自启动", "随 Windows 开机启动", isAutoStartEnabled())
+	// 3. 开机自启动切换
+	autoTitle := "设为开机自启"
+	if isAutoStartEnabled() {
+		autoTitle = "取消开机自启"
+	}
+	mAutoStart = systray.AddMenuItem(autoTitle, "点击切换开机启动设置")
 
 	systray.AddSeparator()
 
-	mQuit = systray.AddMenuItem("退出程序", "退出")
+	// 4. 退出
+	mQuit = systray.AddMenuItem("退出程序", "关闭电量监控")
 
 	go handleMenuEvents()
 	go pollingLoop()
@@ -99,20 +90,19 @@ func onReady() {
 func onExit() {}
 
 func handleMenuEvents() {
+	defer func() { _ = recover() }()
+
 	for {
 		select {
-		case <-mDebug.ClickedCh:
-			go exportDebugFile()
+		case <-mRefresh.ClickedCh:
+			go updateBatteryState()
 		case <-mAutoStart.ClickedCh:
-			current := mAutoStart.Checked()
-			if current {
-				if err := setAutoStart(false); err == nil {
-					mAutoStart.Uncheck()
-				}
+			if isAutoStartEnabled() {
+				_ = setAutoStart(false)
+				mAutoStart.SetTitle("设为开机自启")
 			} else {
-				if err := setAutoStart(true); err == nil {
-					mAutoStart.Check()
-				}
+				_ = setAutoStart(true)
+				mAutoStart.SetTitle("取消开机自启")
 			}
 		case <-mQuit.ClickedCh:
 			systray.Quit()
@@ -121,17 +111,8 @@ func handleMenuEvents() {
 	}
 }
 
-func exportDebugFile() {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-	desktopPath := filepath.Join(home, "Desktop", "dareu_debug.txt")
-	_ = os.WriteFile(desktopPath, []byte(getLog()), 0644)
-	_ = exec.Command("notepad.exe", desktopPath).Start()
-}
-
 func pollingLoop() {
+	// 初次立即触发一次检测
 	updateBatteryState()
 
 	ticker := time.NewTicker(PollingInterval)
@@ -146,20 +127,8 @@ func updateBatteryState() {
 	defer func() { _ = recover() }()
 
 	scanMu.Lock()
-	if isScanning {
-		scanMu.Unlock()
-		return
-	}
-	isScanning = true
-	scanMu.Unlock()
-
-	defer func() {
-		scanMu.Lock()
-		isScanning = false
-		scanMu.Unlock()
-	}()
-
 	state := fetchMouseState()
+	scanMu.Unlock()
 
 	if state.Connected {
 		statusText := "使用中"
@@ -234,7 +203,7 @@ func setAutoStart(enable bool) error {
 	return nil
 }
 
-// 精确对齐控制台 16 字节短报文特征[cite: 20]
+// 专为 2.4G 接收器定制的零阻塞嗅探
 func fetchMouseState() MouseState {
 	defer func() { _ = recover() }()
 
@@ -247,14 +216,11 @@ func fetchMouseState() MouseState {
 	}
 
 	if len(matchedDevices) == 0 {
-		setLog("未找到达尔优 2.4G 接收器 (VID: 0x260D)")
 		return MouseState{Connected: false}
 	}
 
-	var debugLines []string
-
-	for idx, devInfo := range matchedDevices {
-		// 跳过标准鼠标指针接口 (UsagePage 0x01, Usage 0x02)
+	for _, devInfo := range matchedDevices {
+		// 严禁打开系统鼠标指针主通道，防止被 Windows 抛出 Access Violation
 		if devInfo.UsagePage == 0x01 && devInfo.Usage == 0x02 {
 			continue
 		}
@@ -264,11 +230,10 @@ func fetchMouseState() MouseState {
 			continue
 		}
 
-		// 发送达尔优原厂激活帧 (ReportID 8)[cite: 20]
+		// 发送唤醒触发帧 (ReportID 8)
 		req := make([]byte, 65)
 		req[0] = ReportID
 		req[1] = 0x01
-		req[2] = 0x00
 		_, _ = dev.Write(req)
 
 		buf := make([]byte, 256)
@@ -283,59 +248,45 @@ func fetchMouseState() MouseState {
 		var n int
 		select {
 		case n = <-ch:
-		case <-time.After(70 * time.Millisecond):
+		case <-time.After(50 * time.Millisecond):
 			n = 0
 		}
 
 		dev.Close()
 
 		if n > 0 {
-			var hexParts []string
-			limit := 16
-			if n < limit {
-				limit = n
-			}
-			for i := 0; i < limit; i++ {
-				hexParts = append(hexParts, fmt.Sprintf("%02X", buf[i]))
-			}
-			hexStr := strings.Join(hexParts, " ")
-			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X (长%d): %s", idx, devInfo.ProductID, n, hexStr))
-
 			var batVal int = -1
 			var isCharging bool = false
 
-			// 匹配抓包数据特征：Data[0]=8, Data[2]=2 为饱和充满/充电[cite: 20]
-			if n >= 4 {
-				// 如果第一字节是 ReportID 8 或 0[cite: 20]
-				offset := 0
-				if buf[0] == 8 {
-					offset = 0 // 驱动层直接包含了 ReportID[cite: 20]
-				}
+			// 命中你截图展开的 16 字节原始数据: Data[0]=8, Data[2]=2, Data[5..]=255
+			offset := 0
+			if buf[0] == 8 {
+				offset = 0
+			}
 
-				// Data[2] 为 2 代表充电中/已充满[cite: 20]
-				if buf[offset+2] == 2 {
-					isCharging = true
-					batVal = 100 // 充满饱和[cite: 15]
-				}
+			// 状态位为 2 代表已充满/正在充电[cite: 20]
+			if n >= 3 && buf[offset+2] == 2 {
+				isCharging = true
+				batVal = 100 // 充满饱和[cite: 15, 20]
+			}
 
-				// 如果中间填充了大量 0xFF (255)，确认是 100% 充满态[cite: 20]
-				if n >= 10 && buf[offset+5] == 255 && buf[offset+6] == 255 {
-					batVal = 100
-					isCharging = true
-				}
+			// 校验 0xFF 满电特征[cite: 20]
+			if n >= 10 && buf[offset+5] == 255 && buf[offset+6] == 255 {
+				batVal = 100
+				isCharging = true
+			}
 
-				// 如果处于未插线放电状态，探测实际电量
-				if batVal == -1 {
-					for i := 1; i < n; i++ {
-						if buf[i] > 0 && buf[i] <= 100 {
-							batVal = int(buf[i])
-							break
-						}
+			// 普通使用放电时的电量解析
+			if batVal == -1 {
+				for i := 1; i < n; i++ {
+					if buf[i] > 0 && buf[i] <= 100 {
+						batVal = int(buf[i])
+						break
 					}
 				}
 			}
 
-			// 如果是 187 字节长配置帧
+			// 187 字节长配置帧保护
 			if n >= 187 {
 				if buf[10] == 2 || buf[11] == 2 {
 					isCharging = true
@@ -343,7 +294,6 @@ func fetchMouseState() MouseState {
 				}
 			}
 
-			// 有线模式直连判定
 			if devInfo.ProductID == 0x1260 {
 				isCharging = true
 				if batVal == -1 {
@@ -353,8 +303,6 @@ func fetchMouseState() MouseState {
 
 			if batVal > 0 {
 				lastBattery = batVal
-				debugLines = append(debugLines, fmt.Sprintf("==> 成功锁定电量: %d%% (充电状态: %v)", batVal, isCharging))
-				setLog(strings.Join(debugLines, "\n"))
 				return MouseState{
 					Battery:    batVal,
 					IsCharging: isCharging,
@@ -364,11 +312,6 @@ func fetchMouseState() MouseState {
 		}
 	}
 
-	if len(debugLines) > 0 {
-		setLog(strings.Join(debugLines, "\n"))
-	} else {
-		setLog("所有厂商端口暂无回传")
-	}
 	return MouseState{Connected: false}
 }
 
@@ -420,7 +363,6 @@ func createCleanBatteryIco(percent int, isCharging bool, connected bool) []byte 
 			}
 		}
 
-		// 充电时在中心显示黄色闪电
 		if isCharging {
 			boltCol := color.RGBA{255, 214, 10, 255}
 			boltBorder := color.RGBA{0, 0, 0, 200}
@@ -433,39 +375,3 @@ func createCleanBatteryIco(percent int, isCharging bool, connected bool) []byte 
 				{14, 16}, {15, 16},
 				{15, 17},
 				{15, 18},
-			}
-			for _, pt := range boltPixels {
-				m.Set(pt[0]-1, pt[1], boltBorder)
-				m.Set(pt[0]+1, pt[1], boltBorder)
-				m.Set(pt[0], pt[1], boltCol)
-			}
-		}
-	} else {
-		unColor := color.RGBA{255, 204, 0, 255}
-		for x := 10; x <= 19; x++ {
-			m.Set(x, 15, unColor)
-			m.Set(x, 16, unColor)
-		}
-	}
-
-	var pngBuf bytes.Buffer
-	_ = png.Encode(&pngBuf, m)
-	pngBytes := pngBuf.Bytes()
-
-	icoBuf := new(bytes.Buffer)
-	binary.Write(icoBuf, binary.LittleEndian, uint16(0))
-	binary.Write(icoBuf, binary.LittleEndian, uint16(1))
-	binary.Write(icoBuf, binary.LittleEndian, uint16(1))
-
-	icoBuf.WriteByte(byte(w))
-	icoBuf.WriteByte(byte(h))
-	icoBuf.WriteByte(0)
-	icoBuf.WriteByte(0)
-	binary.Write(icoBuf, binary.LittleEndian, uint16(1))
-	binary.Write(icoBuf, binary.LittleEndian, uint16(32))
-	binary.Write(icoBuf, binary.LittleEndian, uint32(len(pngBytes)))
-	binary.Write(icoBuf, binary.LittleEndian, uint32(22))
-
-	icoBuf.Write(pngBytes)
-	return icoBuf.Bytes()
-}
