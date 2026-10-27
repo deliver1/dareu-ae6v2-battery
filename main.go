@@ -20,18 +20,18 @@ import (
 )
 
 const (
-	VendorID        uint16 = 0x260D
-	ReportID        byte   = 0x08
-	PollingInterval        = 5 * time.Second
+	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)
+	ReportID        byte   = 0x08   // 抓包确认 ReportID 8
+	PollingInterval        = 3 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
 	LowBattery = 15
 )
 
 var CandidatePIDs = []uint16{
-	0x1261, // 2.4G 接收器
+	0x1261, // 接收器
 	0x04ED, // 十进制 1261
-	0x1260, // 鼠标本体直连
+	0x1260, // 有线模式
 }
 
 type MouseState struct {
@@ -42,12 +42,11 @@ type MouseState struct {
 
 var (
 	mStatus     *systray.MenuItem
-	mRefresh    *systray.MenuItem
 	mAutoStart  *systray.MenuItem
 	mQuit       *systray.MenuItem
 	hasNotified bool
-	lastBattery int = -1
 	scanMu      sync.Mutex
+	uiMu        sync.Mutex
 )
 
 func main() {
@@ -62,13 +61,13 @@ func onReady() {
 	systray.SetIcon(createCleanBatteryIco(-1, false, false))
 	systray.SetTooltip("达尔优 AE6 V2: 正在侦测...")
 
+	// 状态项
 	mStatus = systray.AddMenuItem("状态: 读取中...", "当前电量状态")
 	mStatus.Disable()
 
 	systray.AddSeparator()
 
-	mRefresh = systray.AddMenuItem("立即刷新电量", "重新扫描达尔优接收器")
-
+	// 开机自启
 	autoTitle := "设为开机自启"
 	if isAutoStartEnabled() {
 		autoTitle = "取消开机自启"
@@ -77,6 +76,7 @@ func onReady() {
 
 	systray.AddSeparator()
 
+	// 退出
 	mQuit = systray.AddMenuItem("退出程序", "关闭电量监控")
 
 	go handleMenuEvents()
@@ -90,8 +90,6 @@ func handleMenuEvents() {
 
 	for {
 		select {
-		case <-mRefresh.ClickedCh:
-			go updateBatteryState()
 		case <-mAutoStart.ClickedCh:
 			if isAutoStartEnabled() {
 				_ = setAutoStart(false)
@@ -108,6 +106,8 @@ func handleMenuEvents() {
 }
 
 func pollingLoop() {
+	// 启动后平缓运行
+	time.Sleep(1 * time.Second)
 	updateBatteryState()
 
 	ticker := time.NewTicker(PollingInterval)
@@ -124,6 +124,9 @@ func updateBatteryState() {
 	scanMu.Lock()
 	state := fetchMouseState()
 	scanMu.Unlock()
+
+	uiMu.Lock()
+	defer uiMu.Unlock()
 
 	if state.Connected {
 		statusText := "使用中"
@@ -198,6 +201,7 @@ func setAutoStart(enable bool) error {
 	return nil
 }
 
+// 专为 2.4G 接收器设计的安全单线程穿透
 func fetchMouseState() MouseState {
 	defer func() { _ = recover() }()
 
@@ -214,7 +218,8 @@ func fetchMouseState() MouseState {
 	}
 
 	for _, devInfo := range matchedDevices {
-		if devInfo.UsagePage == 0x01 && devInfo.Usage == 0x02 {
+		// 严禁打开系统鼠标指针与键盘基础端口 (UsagePage 0x01)
+		if devInfo.UsagePage == 0x01 {
 			continue
 		}
 
@@ -223,6 +228,7 @@ func fetchMouseState() MouseState {
 			continue
 		}
 
+		// 发送唤醒触发帧 (ReportID 8)
 		req := make([]byte, 65)
 		req[0] = ReportID
 		req[1] = 0x01
@@ -240,7 +246,7 @@ func fetchMouseState() MouseState {
 		var n int
 		select {
 		case n = <-ch:
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(40 * time.Millisecond):
 			n = 0
 		}
 
@@ -255,11 +261,13 @@ func fetchMouseState() MouseState {
 				offset = 0
 			}
 
+			// 命中抓包特征包：Data[2]=2 代表已充满/充电中[cite: 20]
 			if n >= 3 && buf[offset+2] == 2 {
 				isCharging = true
-				batVal = 100
+				batVal = 100[cite: 15, 20]
 			}
 
+			// 校验 0xFF 满电特征[cite: 20]
 			if n >= 10 && buf[offset+5] == 255 && buf[offset+6] == 255 {
 				batVal = 100
 				isCharging = true
@@ -289,7 +297,6 @@ func fetchMouseState() MouseState {
 			}
 
 			if batVal > 0 {
-				lastBattery = batVal
 				return MouseState{
 					Battery:    batVal,
 					IsCharging: isCharging,
