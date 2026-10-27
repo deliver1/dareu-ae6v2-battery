@@ -32,14 +32,34 @@ jobs:
           go install github.com/akavel/rsrc@latest
           go mod tidy
 
-      # 下载精美游戏鼠标图标并嵌入 EXE 文件头
-      - name: Embed Custom App Icon
-        shell: bash
+      # 本地原生生成标准 ICO 并注入，彻底告别白框与 bad magic number 报错
+      - name: Generate and Embed Native Icon
+        shell: powershell
         run: |
-          curl -sL -o app.ico https://raw.githubusercontent.com/runelite/runelite/master/runelite-client/src/main/resources/net/runelite/client/ui/runelite.ico || true
-          if [ -f app.ico ]; then
-            rsrc -ico app.ico -o rsrc.syso
-          fi
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 32, 32
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.Clear([System.Drawing.Color]::Transparent)
+          
+          # 绘制一个科技绿色游戏鼠标外形
+          $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 46, 189, 89)), 2
+          $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 30, 30, 30))
+          $g.FillEllipse($brush, 6, 4, 20, 24)
+          $g.DrawEllipse($pen, 6, 4, 20, 24)
+          # 滚轮线条
+          $wheelPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 255, 255, 255)), 2
+          $g.DrawLine($wheelPen, 16, 7, 16, 12)
+          
+          $g.Dispose()
+          $hIcon = $bmp.GetHicon()
+          $icon = [System.Drawing.Icon]::FromHandle($hIcon)
+          $fs = New-Object System.IO.FileStream ("app.ico", [System.IO.FileMode]::Create)
+          $icon.Save($fs)
+          $fs.Close()
+          $bmp.Dispose()
+          
+          # 嵌入 Windows PE 资源
+          rsrc -ico app.ico -o rsrc.syso
 
       - name: Build Windows Binary
         run: |
@@ -62,7 +82,7 @@ jobs:
           name: "达尔优 AE6 V2 托盘助手 ${{ steps.tag.outputs.release_tag }}"
           body: |
             ### 达尔优 AE6 V2 电量监控小工具
-            - 嵌入原生精美图标[cite: 23]。
+            - 嵌入原生精美游戏鼠标图标。
             - 增强达尔优全系 PID 与心跳探测协议[cite: 4, 6]。
             - 新增右键诊断排查日志功能。
           files: DareuAE6V2Tray.exe
