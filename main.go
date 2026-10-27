@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)
-	ReportID        byte   = 0x08   // 抓包确认 ReportID 8
+	VendorID        uint16 = 0x260D
+	ReportID        byte   = 0x08
 	PollingInterval        = 5 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
@@ -62,16 +62,13 @@ func onReady() {
 	systray.SetIcon(createCleanBatteryIco(-1, false, false))
 	systray.SetTooltip("达尔优 AE6 V2: 正在侦测...")
 
-	// 1. 状态显示项（纯文本，点击不触发任何破坏性消息泵）
 	mStatus = systray.AddMenuItem("状态: 读取中...", "当前电量状态")
 	mStatus.Disable()
 
 	systray.AddSeparator()
 
-	// 2. 手动刷新
 	mRefresh = systray.AddMenuItem("立即刷新电量", "重新扫描达尔优接收器")
 
-	// 3. 开机自启动切换
 	autoTitle := "设为开机自启"
 	if isAutoStartEnabled() {
 		autoTitle = "取消开机自启"
@@ -80,7 +77,6 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	// 4. 退出
 	mQuit = systray.AddMenuItem("退出程序", "关闭电量监控")
 
 	go handleMenuEvents()
@@ -112,7 +108,6 @@ func handleMenuEvents() {
 }
 
 func pollingLoop() {
-	// 初次立即触发一次检测
 	updateBatteryState()
 
 	ticker := time.NewTicker(PollingInterval)
@@ -203,7 +198,6 @@ func setAutoStart(enable bool) error {
 	return nil
 }
 
-// 专为 2.4G 接收器定制的零阻塞嗅探
 func fetchMouseState() MouseState {
 	defer func() { _ = recover() }()
 
@@ -220,7 +214,6 @@ func fetchMouseState() MouseState {
 	}
 
 	for _, devInfo := range matchedDevices {
-		// 严禁打开系统鼠标指针主通道，防止被 Windows 抛出 Access Violation
 		if devInfo.UsagePage == 0x01 && devInfo.Usage == 0x02 {
 			continue
 		}
@@ -230,7 +223,6 @@ func fetchMouseState() MouseState {
 			continue
 		}
 
-		// 发送唤醒触发帧 (ReportID 8)
 		req := make([]byte, 65)
 		req[0] = ReportID
 		req[1] = 0x01
@@ -258,25 +250,21 @@ func fetchMouseState() MouseState {
 			var batVal int = -1
 			var isCharging bool = false
 
-			// 命中你截图展开的 16 字节原始数据: Data[0]=8, Data[2]=2, Data[5..]=255
 			offset := 0
 			if buf[0] == 8 {
 				offset = 0
 			}
 
-			// 状态位为 2 代表已充满/正在充电[cite: 20]
 			if n >= 3 && buf[offset+2] == 2 {
 				isCharging = true
-				batVal = 100 // 充满饱和[cite: 15, 20]
+				batVal = 100
 			}
 
-			// 校验 0xFF 满电特征[cite: 20]
 			if n >= 10 && buf[offset+5] == 255 && buf[offset+6] == 255 {
 				batVal = 100
 				isCharging = true
 			}
 
-			// 普通使用放电时的电量解析
 			if batVal == -1 {
 				for i := 1; i < n; i++ {
 					if buf[i] > 0 && buf[i] <= 100 {
@@ -286,7 +274,6 @@ func fetchMouseState() MouseState {
 				}
 			}
 
-			// 187 字节长配置帧保护
 			if n >= 187 {
 				if buf[10] == 2 || buf[11] == 2 {
 					isCharging = true
@@ -375,3 +362,39 @@ func createCleanBatteryIco(percent int, isCharging bool, connected bool) []byte 
 				{14, 16}, {15, 16},
 				{15, 17},
 				{15, 18},
+			}
+			for _, pt := range boltPixels {
+				m.Set(pt[0]-1, pt[1], boltBorder)
+				m.Set(pt[0]+1, pt[1], boltBorder)
+				m.Set(pt[0], pt[1], boltCol)
+			}
+		}
+	} else {
+		unColor := color.RGBA{255, 204, 0, 255}
+		for x := 10; x <= 19; x++ {
+			m.Set(x, 15, unColor)
+			m.Set(x, 16, unColor)
+		}
+	}
+
+	var pngBuf bytes.Buffer
+	_ = png.Encode(&pngBuf, m)
+	pngBytes := pngBuf.Bytes()
+
+	icoBuf := new(bytes.Buffer)
+	binary.Write(icoBuf, binary.LittleEndian, uint16(0))
+	binary.Write(icoBuf, binary.LittleEndian, uint16(1))
+	binary.Write(icoBuf, binary.LittleEndian, uint16(1))
+
+	icoBuf.WriteByte(byte(w))
+	icoBuf.WriteByte(byte(h))
+	icoBuf.WriteByte(0)
+	icoBuf.WriteByte(0)
+	binary.Write(icoBuf, binary.LittleEndian, uint16(1))
+	binary.Write(icoBuf, binary.LittleEndian, uint16(32))
+	binary.Write(icoBuf, binary.LittleEndian, uint32(len(pngBytes)))
+	binary.Write(icoBuf, binary.LittleEndian, uint32(22))
+
+	icoBuf.Write(pngBytes)
+	return icoBuf.Bytes()
+}
