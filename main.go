@@ -20,9 +20,9 @@ import (
 
 const (
 	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)
-	ProductID       uint16 = 0x1261 // AE6 V2 接收器专属 PID (4705)
-	ReportID        byte   = 0x08   // 通信 Report ID
-	BatteryByteIdx  int    = 18     // 电量百分比偏移位
+	ProductID       uint16 = 0x1261 // AE6 V2 接收器专属 PID (4705)[cite: 6]
+	ReportID        byte   = 0x08   // 通信 Report ID[cite: 4, 6]
+	BatteryByteIdx  int    = 18     // 电量百分比偏移位[cite: 6]
 	PollingInterval        = 30 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
@@ -49,8 +49,8 @@ func main() {
 
 func onReady() {
 	systray.SetTitle("达尔优 AE6 V2")
-	systray.SetIcon(createCleanBatteryIco(100, false, true))
-	systray.SetTooltip("达尔优 AE6 V2: 正在初始化...")
+	systray.SetIcon(createCleanBatteryIco(-1, false, false))
+	systray.SetTooltip("达尔优 AE6 V2: 正在侦测设备...")
 
 	mStatus = systray.AddMenuItem("状态: 读取中...", "当前鼠标电量与充电状态")
 	mStatus.Disable()
@@ -113,7 +113,7 @@ func updateBatteryState() {
 
 		tooltip := fmt.Sprintf("%d %%\n%s · AE6 V2", state.Battery, statusText)
 		systray.SetTooltip(tooltip)
-		mStatus.SetTitle(fmt.Sprintf("电量: %d%% (%s)", state.Battery, statusText))
+		mStatus.SetTitle(fmt.Sprintf("当前电量: %d%% (%s)", state.Battery, statusText))
 
 		systray.SetIcon(createCleanBatteryIco(state.Battery, state.IsCharging, true))
 
@@ -127,7 +127,7 @@ func updateBatteryState() {
 		}
 	} else {
 		systray.SetTooltip("未连接 · AE6 V2")
-		mStatus.SetTitle("状态: 接收器未连接")
+		mStatus.SetTitle("状态: 接收器未连接/被占用")
 		systray.SetIcon(createCleanBatteryIco(-1, false, false))
 	}
 }
@@ -174,6 +174,7 @@ func setAutoStart(enable bool) error {
 	return nil
 }
 
+// 穿透式枚举：遍历所有达尔优 2.4G HID 通信端点
 func fetchMouseState() MouseState {
 	devices := hid.Enumerate(VendorID, ProductID)
 	if len(devices) == 0 {
@@ -183,14 +184,16 @@ func fetchMouseState() MouseState {
 	for _, devInfo := range devices {
 		dev, err := devInfo.Open()
 		if err != nil {
-			continue
+			continue // 忽略被系统锁定的指针接口
 		}
 
+		// 构造 65 字节标准控制包（达尔优心跳包结构）
 		query := make([]byte, 65)
 		query[0] = ReportID
+		query[1] = 0x02 // 命令字
 		_, _ = dev.Write(query)
 
-		buf := make([]byte, 192)
+		buf := make([]byte, 256)
 		readCh := make(chan int, 1)
 		go func() {
 			n, _ := dev.Read(buf)
@@ -200,7 +203,7 @@ func fetchMouseState() MouseState {
 		var n int
 		select {
 		case n = <-readCh:
-		case <-time.After(120 * time.Millisecond):
+		case <-time.After(200 * time.Millisecond):
 			n = 0
 		}
 
@@ -210,31 +213,28 @@ func fetchMouseState() MouseState {
 			var batVal int = -1
 			var isCharging bool = false
 
+			// 1. 精确匹配第 18 位下标[cite: 6]
 			if n > BatteryByteIdx && buf[BatteryByteIdx] > 0 && buf[BatteryByteIdx] <= 100 {
 				batVal = int(buf[BatteryByteIdx])
 			} else {
+				// 2. 启发式探测：在返回帧中匹配合理的电池数值 (30% ~ 100%)
 				for i := 0; i < n; i++ {
-					if buf[i] > 0 && buf[i] <= 100 {
+					if buf[i] >= 20 && buf[i] <= 100 {
 						batVal = int(buf[i])
 						break
 					}
 				}
 			}
 
-			if n > BatteryByteIdx+1 {
-				if buf[BatteryByteIdx+1] == 1 || buf[BatteryByteIdx+1] == 2 {
-					isCharging = true
-				}
+			// 3. 充电判定：检查充电标志位
+			if n > BatteryByteIdx+1 && (buf[BatteryByteIdx+1] == 1 || buf[BatteryByteIdx+1] == 2) {
+				isCharging = true
 			}
-
 			if lastBattery != -1 && batVal > lastBattery {
 				isCharging = true
 			}
 			if batVal != -1 {
 				lastBattery = batVal
-			}
-
-			if batVal != -1 {
 				return MouseState{
 					Battery:    batVal,
 					IsCharging: isCharging,
