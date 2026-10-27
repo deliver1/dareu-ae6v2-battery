@@ -22,20 +22,19 @@ import (
 )
 
 const (
-	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)[cite: 6]
-	ProductID       uint16 = 0x1261 // 接收器专属 PID (4705)[cite: 6]
-	ReportID        byte   = 0x08   // 抓包确认 ReportID[cite: 4, 6]
-	BatteryByteIdx  int    = 18     // 下标 18[cite: 6]
-	PollingInterval        = 15 * time.Second
+	VendorID        uint16 = 0x260D
+	ReportID        byte   = 0x08
+	BatteryByteIdx  int    = 18
+	PollingInterval        = 10 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
 	LowBattery = 15
 )
 
 var CandidatePIDs = []uint16{
-	0x1261, // 接收器[cite: 6]
-	0x1260, // 鼠标本体[cite: 6]
-	0x04ED, // 十进制兼容[cite: 4]
+	0x1261, // 2.4G 接收器
+	0x1260, // 鼠标有线直连
+	0x04ED,
 	0x0260,
 }
 
@@ -52,7 +51,7 @@ var (
 	mQuit       *systray.MenuItem
 	hasNotified bool
 	lastBattery int = -1
-	lastLog     string = "尚未开始扫描"
+	lastLog     string = "系统启动，准备首次扫描..."
 	logMu       sync.Mutex
 	isScanning  bool
 	scanMu      sync.Mutex
@@ -61,7 +60,7 @@ var (
 func setLog(msg string) {
 	logMu.Lock()
 	defer logMu.Unlock()
-	lastLog = fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg)
+	lastLog = fmt.Sprintf("[%s]\n%s", time.Now().Format("15:04:05"), msg)
 }
 
 func getLog() string {
@@ -80,7 +79,7 @@ func onReady() {
 
 	systray.SetTitle("达尔优 AE6 V2")
 	systray.SetIcon(createCleanBatteryIco(-1, false, false))
-	systray.SetTooltip("达尔优 AE6 V2: 正在侦测...")
+	systray.SetTooltip("达尔优 AE6 V2: 侦测中...")
 
 	mStatus = systray.AddMenuItem("状态: 读取中...", "当前电量状态")
 	mStatus.Disable()
@@ -135,7 +134,7 @@ func exportDebugFile() {
 }
 
 func pollingLoop() {
-	time.Sleep(500 * time.Millisecond)
+	// 启动后先进行一次检测
 	updateBatteryState()
 
 	ticker := time.NewTicker(PollingInterval)
@@ -149,7 +148,6 @@ func pollingLoop() {
 func updateBatteryState() {
 	defer func() { _ = recover() }()
 
-	// 互斥保护，防止轮询与前一次扫描重叠导致句柄冲突崩溃
 	scanMu.Lock()
 	if isScanning {
 		scanMu.Unlock()
@@ -188,7 +186,7 @@ func updateBatteryState() {
 		}
 	} else {
 		systray.SetTooltip("未连接 · AE6 V2")
-		mStatus.SetTitle("状态: 接收器未连接/无数据")
+		mStatus.SetTitle("状态: 接收器未连接/休眠")
 		systray.SetIcon(createCleanBatteryIco(-1, false, false))
 	}
 }
@@ -235,13 +233,11 @@ func setAutoStart(enable bool) error {
 	return nil
 }
 
-// 安全扫描模式：绝不强行并发中断句柄，杜绝闪退
+// 采用安全非阻塞逻辑穿透达尔优接口
 func fetchMouseState() MouseState {
 	defer func() { _ = recover() }()
 
 	var matchedDevices []hid.DeviceInfo
-
-	// 枚举所有支持的候选 PID[cite: 4, 6]
 	for _, pid := range CandidatePIDs {
 		devs := hid.Enumerate(VendorID, pid)
 		if len(devs) > 0 {
@@ -250,51 +246,64 @@ func fetchMouseState() MouseState {
 	}
 
 	if len(matchedDevices) == 0 {
-		allDevs := hid.Enumerate(VendorID, 0)
-		for _, d := range allDevs {
-			matchedDevices = append(matchedDevices, d)
-		}
-	}
-
-	if len(matchedDevices) == 0 {
-		setLog("未找到任何达尔优设备 (VID: 0x260D)")
+		setLog("未找到任何达尔优设备接口 (VID: 0x260D)")
 		return MouseState{Connected: false}
 	}
 
 	var debugLines []string
+	debugLines = append(debugLines, fmt.Sprintf("枚举到 %d 个达尔优相关端点:", len(matchedDevices)))
 
 	for idx, devInfo := range matchedDevices {
-		// 忽略标准鼠标输入指针接口（UsagePage: 0x01, Usage: 0x02），这些属于系统加锁区
+		// 过滤掉系统锁死的标准鼠标端点 (UsagePage 0x01, Usage 0x02)
 		if devInfo.UsagePage == 0x01 && devInfo.Usage == 0x02 {
-			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X 系统指针接口(跳过)", idx, devInfo.ProductID))
+			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X 鼠标指针主端口(系统锁死/跳过)", idx, devInfo.ProductID))
 			continue
 		}
 
 		dev, err := devInfo.Open()
 		if err != nil {
-			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X 独占打不开", idx, devInfo.ProductID))
+			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X 打开失败(独占)", idx, devInfo.ProductID))
 			continue
 		}
 
-		// 达尔优 WebHID 真实唤醒包序列：[cite: 4]
-		// 1. 发送带 ReportID 0x08 的唤醒配置探测[cite: 4]
-		req := make([]byte, 65)
-		req[0] = ReportID
-		req[1] = 0x01
-		req[2] = 0x01
-		_, _ = dev.Write(req)
+		// 达尔优 WebHID 核心握手序列：必须先向 Report 0x08 写入指令[cite: 4]
+		// 握手触发包 1
+		req1 := make([]byte, 65)
+		req1[0] = ReportID // 0x08[cite: 4]
+		req1[1] = 0x01
+		req1[2] = 0x01
+		_, _ = dev.Write(req1)
 
-		// 2. 发送状态查询命令
+		// 握手触发包 2 (请求电量与配置)
 		req2 := make([]byte, 65)
-		req2[0] = ReportID
+		req2[0] = ReportID // 0x08[cite: 4]
 		req2[1] = 0x02
 		req2[2] = 0x01
 		_, _ = dev.Write(req2)
 
-		// 安全同步读取，每次只等待 50 毫秒，绝不启动无管控协程挂起
+		// 用独立带超时的安全通道读取，绝不卡死主循环
 		buf := make([]byte, 192)
-		n, _ := dev.Read(buf)
+		type readResult struct {
+			n   int
+			err error
+		}
+		ch := make(chan readResult, 1)
 
+		go func(d *hid.Device) {
+			defer func() { _ = recover() }()
+			n, err := d.Read(buf)
+			ch <- readResult{n: n, err: err}
+		}(dev)
+
+		var n int
+		select {
+		case res := <-ch:
+			n = res.n
+		case <-time.After(35 * time.Millisecond): // 35 毫秒无反应立即脱困
+			n = 0
+		}
+
+		// 保持单次探测生命周期干净
 		dev.Close()
 
 		if n > 0 {
@@ -307,7 +316,7 @@ func fetchMouseState() MouseState {
 				hexParts = append(hexParts, fmt.Sprintf("%02X", buf[i]))
 			}
 			hexStr := strings.Join(hexParts, " ")
-			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X (长%d): %s", idx, devInfo.ProductID, n, hexStr))
+			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X (长%d) 数据: %s", idx, devInfo.ProductID, n, hexStr))
 
 			var batVal int = -1
 			var isCharging bool = false
@@ -316,6 +325,7 @@ func fetchMouseState() MouseState {
 			if n > BatteryByteIdx && buf[BatteryByteIdx] > 0 && buf[BatteryByteIdx] <= 100 {
 				batVal = int(buf[BatteryByteIdx])
 			} else {
+				// 启发式搜索 (10~100)
 				for i := 1; i < n; i++ {
 					if buf[i] >= 10 && buf[i] <= 100 {
 						batVal = int(buf[i])
@@ -324,7 +334,7 @@ func fetchMouseState() MouseState {
 				}
 			}
 
-			// 充电状态检测
+			// 充电状态探测
 			if n > BatteryByteIdx+1 && (buf[BatteryByteIdx+1] == 1 || buf[BatteryByteIdx+1] == 2) {
 				isCharging = true
 			}
@@ -337,7 +347,8 @@ func fetchMouseState() MouseState {
 
 			if batVal > 0 {
 				lastBattery = batVal
-				setLog(fmt.Sprintf("读取成功!\nPID:0x%04X 电量:%d%% 充电:%v\n原始前段: %s", devInfo.ProductID, batVal, isCharging, hexStr))
+				debugLines = append(debugLines, fmt.Sprintf("==> 成功锁定有效电量: %d%% (充电中: %v)", batVal, isCharging))
+				setLog(strings.Join(debugLines, "\n"))
 				return MouseState{
 					Battery:    batVal,
 					IsCharging: isCharging,
@@ -345,7 +356,7 @@ func fetchMouseState() MouseState {
 				}
 			}
 		} else {
-			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X 厂商接口静默", idx, devInfo.ProductID))
+			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X 通道未响应", idx, devInfo.ProductID))
 		}
 	}
 
