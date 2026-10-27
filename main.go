@@ -11,27 +11,49 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/getlantern/systray"
-	"github.com/karalabe/hid"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"gopkg.in/toast.v1"
 )
 
 const (
-	VendorID        uint16 = 0x260D
-	ReportID        byte   = 0x08
-	PollingInterval        = 3 * time.Second
+	TargetVID       = "260d" // 达尔优 VID (小写匹配)
+	TargetPID       = "1261" // 接收器 PID
+	PollingInterval = 4 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
 	LowBattery = 15
 )
 
-var CandidatePIDs = []uint16{
-	0x1261,
-	0x04ED,
-	0x1260,
+var (
+	modhid               = windows.NewLazySystemDLL("hid.dll")
+	procHidD_GetHidGuid  = modhid.NewProc("HidD_GetHidGuid")
+	procHidD_GetAttributes = modhid.NewProc("HidD_GetAttributes")
+
+	modsetupapi                          = windows.NewLazySystemDLL("setupapi.dll")
+	procSetupDiGetClassDevsW             = modsetupapi.NewProc("SetupDiGetClassDevsW")
+	procSetupDiEnumDeviceInterfaces      = modsetupapi.NewProc("SetupDiEnumDeviceInterfaces")
+	procSetupDiGetDeviceInterfaceDetailW = modsetupapi.NewProc("SetupDiGetDeviceInterfaceDetailW")
+	procSetupDiDestroyDeviceInfoList     = modsetupapi.NewProc("SetupDiDestroyDeviceInfoList")
+)
+
+type HIDD_ATTRIBUTES struct {
+	Size           uint32
+	VendorID       uint16
+	ProductID      uint16
+	VersionNumber  uint16
+}
+
+type SP_DEVICE_INTERFACE_DATA struct {
+	CbSize             uint32
+	InterfaceClassGuid windows.GUID
+	Flags              uint32
+	Reserved           uintptr
 }
 
 type MouseState struct {
@@ -50,16 +72,13 @@ var (
 )
 
 func main() {
-	defer func() { _ = recover() }()
 	systray.Run(onReady, onExit)
 }
 
 func onReady() {
-	defer func() { _ = recover() }()
-
 	systray.SetTitle("达尔优 AE6 V2")
 	systray.SetIcon(createCleanBatteryIco(-1, false, false))
-	systray.SetTooltip("达尔优 AE6 V2: 正在侦测...")
+	systray.SetTooltip("达尔优 AE6 V2: 侦测中...")
 
 	mStatus = systray.AddMenuItem("状态: 读取中...", "当前电量状态")
 	mStatus.Disable()
@@ -83,8 +102,6 @@ func onReady() {
 func onExit() {}
 
 func handleMenuEvents() {
-	defer func() { _ = recover() }()
-
 	for {
 		select {
 		case <-mAutoStart.ClickedCh:
@@ -115,10 +132,8 @@ func pollingLoop() {
 }
 
 func updateBatteryState() {
-	defer func() { _ = recover() }()
-
 	scanMu.Lock()
-	state := fetchMouseState()
+	state := fetchMouseStateNative()
 	scanMu.Unlock()
 
 	uiMu.Lock()
@@ -197,101 +212,178 @@ func setAutoStart(enable bool) error {
 	return nil
 }
 
-func fetchMouseState() MouseState {
-	defer func() { _ = recover() }()
+// 纯 Win32 API 遍历所有 HID 设备路径（完全避开 Cgo 崩溃）
+func fetchMouseStateNative() MouseState {
+	var hidGuid windows.GUID
+	procHidD_GetHidGuid.Call(uintptr(unsafe.Pointer(&hidGuid)))
 
-	var matchedDevices []hid.DeviceInfo
-	for _, pid := range CandidatePIDs {
-		devs := hid.Enumerate(VendorID, pid)
-		if len(devs) > 0 {
-			matchedDevices = append(matchedDevices, devs...)
-		}
-	}
-
-	if len(matchedDevices) == 0 {
+	deviceInfoSet, _, _ := procSetupDiGetClassDevsW.Call(
+		uintptr(unsafe.Pointer(&hidGuid)),
+		0,
+		0,
+		uintptr(0x10|0x02), // DIGCF_DEVICEINTERFACE | DIGCF_PRESENT
+	)
+	if deviceInfoSet == uintptr(windows.InvalidHandle) {
 		return MouseState{Connected: false}
 	}
+	defer procSetupDiDestroyDeviceInfoList.Call(deviceInfoSet)
 
-	for _, devInfo := range matchedDevices {
-		if devInfo.UsagePage == 0x01 {
+	var interfaceData SP_DEVICE_INTERFACE_DATA
+	interfaceData.CbSize = uint32(unsafe.Sizeof(interfaceData))
+
+	var index uint32 = 0
+	for {
+		res, _, _ := procSetupDiEnumDeviceInterfaces.Call(
+			deviceInfoSet,
+			0,
+			uintptr(unsafe.Pointer(&hidGuid)),
+			uintptr(index),
+			uintptr(unsafe.Pointer(&interfaceData)),
+		)
+		if res == 0 {
+			break
+		}
+		index++
+
+		var requiredSize uint32
+		procSetupDiGetDeviceInterfaceDetailW.Call(
+			deviceInfoSet,
+			uintptr(unsafe.Pointer(&interfaceData)),
+			0,
+			0,
+			uintptr(unsafe.Pointer(&requiredSize)),
+			0,
+		)
+		if requiredSize == 0 {
 			continue
 		}
 
-		dev, err := devInfo.Open()
-		if err != nil {
+		detailData := make([]byte, requiredSize)
+		// 设置 cbSize 字段 (在 x64 下通常是 8 或 5 字节，标准取 8)
+		*(*uint32)(unsafe.Pointer(&detailData[0])) = 8
+		if unsafe.Sizeof(uintptr(0)) == 4 {
+			*(*uint32)(unsafe.Pointer(&detailData[0])) = 5 // 32位系统
+		}
+
+		resDetail, _, _ := procSetupDiGetDeviceInterfaceDetailW.Call(
+			deviceInfoSet,
+			uintptr(unsafe.Pointer(&interfaceData)),
+			uintptr(unsafe.Pointer(&detailData[0])),
+			uintptr(requiredSize),
+			0,
+			0,
+		)
+		if resDetail == 0 {
 			continue
 		}
 
-		req := make([]byte, 65)
-		req[0] = ReportID
-		req[1] = 0x01
-		_, _ = dev.Write(req)
-
-		buf := make([]byte, 256)
-		ch := make(chan int, 1)
-
-		go func(d *hid.Device) {
-			defer func() { _ = recover() }()
-			n, _ := d.Read(buf)
-			ch <- n
-		}(dev)
-
-		var n int
-		select {
-		case n = <-ch:
-		case <-time.After(40 * time.Millisecond):
-			n = 0
+		// 提取设备路径字符串
+		pathOffset := 4
+		pathRunes := make([]uint16, 0)
+		for i := pathOffset; i < len(detailData)-1; i += 2 {
+			u := binary.LittleEndian.Uint16(detailData[i : i+2])
+			if u == 0 {
+				break
+			}
+			pathRunes = append(pathRunes, u)
 		}
+		devPath := windows.UTF16ToString(pathRunes)
 
-		dev.Close()
-
-		if n > 0 {
-			var batVal int = -1
-			var isCharging bool = false
-
-			offset := 0
-			if buf[0] == 8 {
-				offset = 0
+		// 检查路径是否包含达尔优接收器 VID/PID
+		pathLower := bytes.ToLower([]byte(devPath))
+		if bytes.Contains(pathLower, []byte("vid_260d")) && (bytes.Contains(pathLower, []byte("pid_1261")) || bytes.Contains(pathLower, []byte("pid_1260")) || bytes.Contains(pathLower, []byte("pid_04ed"))) {
+			// 以完全非独占共享模式打开设备
+			h, err := windows.CreateFile(
+				windows.StringToUTF16Ptr(devPath),
+				windows.GENERIC_READ|windows.GENERIC_WRITE,
+				windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+				nil,
+				windows.OPEN_EXISTING,
+				0,
+				0,
+			)
+			if err != nil {
+				// 尝试纯只读打开
+				h, err = windows.CreateFile(
+					windows.StringToUTF16Ptr(devPath),
+					windows.GENERIC_READ,
+					windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+					nil,
+					windows.OPEN_EXISTING,
+					0,
+					0,
+				)
+				if err != nil {
+					continue
+				}
 			}
 
-			if n >= 3 && buf[offset+2] == 2 {
-				isCharging = true
-				batVal = 100
+			// 发送 8 号 Report 心跳[cite: 4, 20]
+			cmd := make([]byte, 65)
+			cmd[0] = 0x08
+			cmd[1] = 0x01
+			var bytesWritten uint32
+			_ = windows.WriteFile(h, cmd, &bytesWritten, nil)
+
+			buf := make([]byte, 256)
+			var bytesRead uint32
+
+			// 设置短超时异步读取
+			done := make(chan bool, 1)
+			go func() {
+				_ = windows.ReadFile(h, buf, &bytesRead, nil)
+				done <- true
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(30 * time.Millisecond):
 			}
 
-			if n >= 10 && buf[offset+5] == 255 && buf[offset+6] == 255 {
-				batVal = 100
-				isCharging = true
-			}
+			windows.CloseHandle(h)
 
-			if batVal == -1 {
-				for i := 1; i < n; i++ {
-					if buf[i] > 0 && buf[i] <= 100 {
-						batVal = int(buf[i])
-						break
+			if bytesRead > 0 {
+				// 检查抓包特征: Data[2]=2 为充满/充电中，或包含大量 0xFF[cite: 20]
+				offset := 0
+				if buf[0] == 0x08 {
+					offset = 0[cite: 20]
+				}
+
+				batVal := -1
+				isCharging := false
+
+				if bytesRead >= 3 && buf[offset+2] == 2 {
+					isCharging = true
+					batVal = 100[cite: 15, 20]
+				}
+
+				if bytesRead >= 10 && buf[offset+5] == 255 && buf[offset+6] == 255 {
+					batVal = 100
+					isCharging = true
+				}
+
+				if batVal == -1 {
+					for i := 1; i < int(bytesRead); i++ {
+						if buf[i] > 0 && buf[i] <= 100 {
+							batVal = int(buf[i])
+							break
+						}
 					}
 				}
-			}
 
-			if n >= 187 {
-				if buf[10] == 2 || buf[11] == 2 {
+				if bytes.Contains(pathLower, []byte("pid_1260")) {
 					isCharging = true
-					batVal = 100
+					if batVal == -1 {
+						batVal = 100
+					}
 				}
-			}
 
-			if devInfo.ProductID == 0x1260 {
-				isCharging = true
-				if batVal == -1 {
-					batVal = 100
-				}
-			}
-
-			if batVal > 0 {
-				return MouseState{
-					Battery:    batVal,
-					IsCharging: isCharging,
-					Connected:  true,
+				if batVal > 0 {
+					return MouseState{
+						Battery:    batVal,
+						IsCharging: isCharging,
+						Connected:  true,
+					}
 				}
 			}
 		}
