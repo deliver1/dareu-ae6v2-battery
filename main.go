@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)[cite: 6]
-	ProductID       uint16 = 0x1261 // AE6 V2 接收器专属 PID (4705)[cite: 6]
+	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)
+	ProductID       uint16 = 0x1261 // AE6 V2 接收器专属 PID (4705)
 	ReportID        byte   = 0x08   // 通信 Report ID[cite: 4, 6]
 	BatteryByteIdx  int    = 18     // 电量百分比偏移位[cite: 6]
 	PollingInterval        = 45 * time.Second
@@ -289,4 +289,18 @@ func createIcoData(percent int) []byte {
 	// ICONDIR
 	binary.Write(icoBuf, binary.LittleEndian, uint16(0)) // 保留
 	binary.Write(icoBuf, binary.LittleEndian, uint16(1)) // 1 = 图标
-	binary.Write(icoBuf, binary.LittleEndian, uint16(1)) //
+	binary.Write(icoBuf, binary.LittleEndian, uint16(1)) // 1 张图片
+
+	// ICONDIRENTRY
+	icoBuf.WriteByte(byte(w))
+	icoBuf.WriteByte(byte(h))
+	icoBuf.WriteByte(0) // 调色板
+	icoBuf.WriteByte(0) // 保留
+	binary.Write(icoBuf, binary.LittleEndian, uint16(1))
+	binary.Write(icoBuf, binary.LittleEndian, uint16(32))
+	binary.Write(icoBuf, binary.LittleEndian, uint32(len(pngBytes)))
+	binary.Write(icoBuf, binary.LittleEndian, uint32(22)) // 偏移 22 字节
+
+	icoBuf.Write(pngBytes)
+	return icoBuf.Bytes()
+}
