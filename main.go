@@ -22,19 +22,21 @@ import (
 )
 
 const (
-	VendorID        uint16 = 0x260D
-	ReportID        byte   = 0x08
-	BatteryByteIdx  int    = 18
-	PollingInterval        = 30 * time.Second
+	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)[cite: 6]
+	ReportID        byte   = 0x08   // 抓包确认的 ReportID[cite: 4, 6]
+	BatteryByteIdx  int    = 18     // 下标 18[cite: 6]
+	PollingInterval        = 10 * time.Second // 充电时加快刷新频率 (10秒一次)
 
 	AppName    = "DareuAE6V2Tray"
 	LowBattery = 15
 )
 
+// 包含无线接收器与有线插线模式下的所有可能 PID[cite: 4, 6]
 var CandidatePIDs = []uint16{
-	0x1261,
-	0x04ED,
-	0x1260,
+	0x1261, // 2.4G 接收器[cite: 6]
+	0x1260, // 鼠标本体有线插线模式
+	0x04ED, // 十进制 1261 兼容项[cite: 4]
+	0x0260,
 	0x0001,
 }
 
@@ -42,6 +44,7 @@ type MouseState struct {
 	Battery    int
 	IsCharging bool
 	Connected  bool
+	RawBytes   string
 }
 
 var (
@@ -81,7 +84,7 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	mDebug = systray.AddMenuItem("排查诊断信息", "点击查看 HID 接口匹配详情")
+	mDebug = systray.AddMenuItem("排查诊断信息", "点击查看 HID 数据包字节")
 
 	mAutoStart = systray.AddMenuItemCheckbox("开机自启动", "随 Windows 开机启动", isAutoStartEnabled())
 
@@ -206,6 +209,7 @@ func setAutoStart(enable bool) error {
 func fetchMouseState() MouseState {
 	var matchedDevices []hid.DeviceInfo
 
+	// 1. 扫描所有可能 PID（包含无线与有线）[cite: 4, 6]
 	for _, pid := range CandidatePIDs {
 		devs := hid.Enumerate(VendorID, pid)
 		if len(devs) > 0 {
@@ -213,37 +217,31 @@ func fetchMouseState() MouseState {
 		}
 	}
 
+	// 2. 兜底扫描全部达尔优设备
 	if len(matchedDevices) == 0 {
 		allDevs := hid.Enumerate(VendorID, 0)
 		for _, d := range allDevs {
-			if strings.Contains(strings.ToLower(d.Product), "receiver") || strings.Contains(strings.ToLower(d.Product), "dareu") || strings.Contains(strings.ToLower(d.Product), "mouse") {
-				matchedDevices = append(matchedDevices, d)
-			}
+			matchedDevices = append(matchedDevices, d)
 		}
 	}
 
 	if len(matchedDevices) == 0 {
-		setLog("未找到任何达尔优 HID 接收器设备 (VID: 0x260D)")
+		setLog("未找到任何达尔优设备 (VID: 0x260D)")
 		return MouseState{Connected: false}
 	}
-
-	var logSb strings.Builder
-	logSb.WriteString(fmt.Sprintf("找到 %d 个达尔优接口:\n", len(matchedDevices)))
 
 	for idx, devInfo := range matchedDevices {
 		dev, err := devInfo.Open()
 		if err != nil {
-			logSb.WriteString(fmt.Sprintf("[%d] PID:0x%04X 打开被拒(系统独占)\n", idx, devInfo.ProductID))
 			continue
 		}
 
-		// 发送唤醒心跳 1
+		// 发送达尔优心跳与电量触发包
 		q1 := make([]byte, 65)
 		q1[0] = ReportID
 		q1[1] = 0x01
 		_, _ = dev.Write(q1)
 
-		// 发送唤醒心跳 2
 		q2 := make([]byte, 65)
 		q2[0] = ReportID
 		q2[1] = 0x02
@@ -259,38 +257,59 @@ func fetchMouseState() MouseState {
 		var n int
 		select {
 		case n = <-readCh:
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(150 * time.Millisecond):
 			n = 0
 		}
 		dev.Close()
-
-		logSb.WriteString(fmt.Sprintf("[%d] PID:0x%04X 读到 %d 字节\n", idx, devInfo.ProductID, n))
 
 		if n > 0 {
 			var batVal int = -1
 			var isCharging bool = false
 
+			// 优先读取 offset 18[cite: 6]
 			if n > BatteryByteIdx && buf[BatteryByteIdx] > 0 && buf[BatteryByteIdx] <= 100 {
 				batVal = int(buf[BatteryByteIdx])
 			} else {
+				// 启发式搜索有效电量 (10~100)
 				for i := 0; i < n; i++ {
-					if buf[i] >= 20 && buf[i] <= 100 {
+					if buf[i] >= 10 && buf[i] <= 100 {
 						batVal = int(buf[i])
 						break
 					}
 				}
 			}
 
+			// 深度识别充电状态：
+			// 1. 检查 offset 19 (充电状态位: 1 或 2)[cite: 6]
 			if n > BatteryByteIdx+1 && (buf[BatteryByteIdx+1] == 1 || buf[BatteryByteIdx+1] == 2) {
 				isCharging = true
 			}
+			// 2. 检查前导状态字 (达尔优有线充电时包头常带 0x01/0x02)
+			if n > 2 && (buf[1] == 0x02 || buf[2] == 0x01) {
+				isCharging = true
+			}
+			// 3. 有线模式 PID (0x1260) 默认即为插线充电中
+			if devInfo.ProductID == 0x1260 {
+				isCharging = true
+			}
+			// 4. 电量递增判定
 			if lastBattery != -1 && batVal > lastBattery {
 				isCharging = true
 			}
 
 			if batVal != -1 {
 				lastBattery = batVal
-				setLog(fmt.Sprintf("读取成功! PID: 0x%04X, 电量: %d%%, 充: %v", devInfo.ProductID, batVal, isCharging))
+				// 记录前 24 个字节十六进制，方便排查
+				var hexStr []string
+				limit := 24
+				if n < limit {
+					limit = n
+				}
+				for i := 0; i < limit; i++ {
+					hexStr = append(hexStr, fmt.Sprintf("%02X", buf[i]))
+				}
+				setLog(fmt.Sprintf("接口[%d] PID:0x%04X\n电量:%d%% 充电:%v\n字节:%s", idx, devInfo.ProductID, batVal, isCharging, strings.Join(hexStr, " ")))
+
 				return MouseState{
 					Battery:    batVal,
 					IsCharging: isCharging,
@@ -300,7 +319,7 @@ func fetchMouseState() MouseState {
 		}
 	}
 
-	setLog(logSb.String())
+	setLog("扫描了设备但未解析到有效电量数据")
 	return MouseState{Connected: false}
 }
 
@@ -352,8 +371,10 @@ func createCleanBatteryIco(percent int, isCharging bool, connected bool) []byte 
 			}
 		}
 
+		// 充电时在电池正中心点亮高对比度黄色闪电 ⚡
 		if isCharging {
-			boltCol := color.RGBA{255, 69, 58, 255}
+			boltCol := color.RGBA{255, 214, 10, 255} // 明亮金色闪电
+			boltBorder := color.RGBA{0, 0, 0, 200}  // 黑色描边防吃色
 			boltPixels := [][2]int{
 				{16, 11},
 				{15, 12}, {16, 12},
@@ -365,6 +386,8 @@ func createCleanBatteryIco(percent int, isCharging bool, connected bool) []byte 
 				{15, 18},
 			}
 			for _, pt := range boltPixels {
+				m.Set(pt[0]-1, pt[1], boltBorder)
+				m.Set(pt[0]+1, pt[1], boltBorder)
 				m.Set(pt[0], pt[1], boltCol)
 			}
 		}
