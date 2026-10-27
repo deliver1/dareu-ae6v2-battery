@@ -22,19 +22,18 @@ import (
 )
 
 const (
-	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)
-	ReportID        byte   = 0x08   // 抓包确认的 ReportID[cite: 4, 6]
-	BatteryByteIdx  int    = 18     // 下标 18[cite: 6]
+	VendorID        uint16 = 0x260D
+	ReportID        byte   = 0x08
+	BatteryByteIdx  int    = 18
 	PollingInterval        = 30 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
 	LowBattery = 15
 )
 
-// 支持达尔优所有可能的 2.4G 接收器 PID 列表[cite: 4, 6]
 var CandidatePIDs = []uint16{
-	0x1261, // 截图所示的主接收器 PID[cite: 6]
-	0x04ED, // 十进制 1261 转换值[cite: 4]
+	0x1261,
+	0x04ED,
 	0x1260,
 	0x0001,
 }
@@ -46,14 +45,14 @@ type MouseState struct {
 }
 
 var (
-	mStatus      *systray.MenuItem
-	mDebug       *systray.MenuItem
-	mAutoStart   *systray.MenuItem
-	mQuit        *systray.MenuItem
-	hasNotified  bool
-	lastBattery  int = -1
-	lastLog      string = "尚未开始扫描"
-	logMu        sync.Mutex
+	mStatus     *systray.MenuItem
+	mDebug      *systray.MenuItem
+	mAutoStart  *systray.MenuItem
+	mQuit       *systray.MenuItem
+	hasNotified bool
+	lastBattery int = -1
+	lastLog     string = "尚未开始扫描"
+	logMu       sync.Mutex
 )
 
 func setLog(msg string) {
@@ -100,7 +99,6 @@ func handleMenuEvents() {
 	for {
 		select {
 		case <-mDebug.ClickedCh:
-			// 弹窗显示排查日志，方便直接看原因
 			msg := getLog()
 			windows.MessageBox(0, windows.StringToUTF16Ptr(msg), windows.StringToUTF16Ptr("达尔优 AE6 V2 检测日志"), windows.MB_OK|windows.MB_ICONINFORMATION)
 		case <-mAutoStart.ClickedCh:
@@ -205,11 +203,9 @@ func setAutoStart(enable bool) error {
 	return nil
 }
 
-// 深度探测所有匹配接口并发送唤醒序列
 func fetchMouseState() MouseState {
 	var matchedDevices []hid.DeviceInfo
 
-	// 1. 枚举所有候选 PID[cite: 4, 6]
 	for _, pid := range CandidatePIDs {
 		devs := hid.Enumerate(VendorID, pid)
 		if len(devs) > 0 {
@@ -217,7 +213,6 @@ func fetchMouseState() MouseState {
 		}
 	}
 
-	// 2. 如果没找到，扫描全部 0x260D 的达尔优设备兜底
 	if len(matchedDevices) == 0 {
 		allDevs := hid.Enumerate(VendorID, 0)
 		for _, d := range allDevs {
@@ -242,15 +237,15 @@ func fetchMouseState() MouseState {
 			continue
 		}
 
-		// 发送达尔优初始化心跳指令 1：查询设备属性包
+		// 发送唤醒心跳 1
 		q1 := make([]byte, 65)
-		q1[0] = ReportID[cite: 4]
+		q1[0] = ReportID
 		q1[1] = 0x01
 		_, _ = dev.Write(q1)
 
-		// 发送达尔优初始化心跳指令 2：查询实时状态包
+		// 发送唤醒心跳 2
 		q2 := make([]byte, 65)
-		q2[0] = ReportID[cite: 4]
+		q2[0] = ReportID
 		q2[1] = 0x02
 		_, _ = dev.Write(q2)
 
@@ -275,11 +270,9 @@ func fetchMouseState() MouseState {
 			var batVal int = -1
 			var isCharging bool = false
 
-			// 检查下标 18[cite: 6]
 			if n > BatteryByteIdx && buf[BatteryByteIdx] > 0 && buf[BatteryByteIdx] <= 100 {
 				batVal = int(buf[BatteryByteIdx])
 			} else {
-				// 启发式搜索 (30~100)
 				for i := 0; i < n; i++ {
 					if buf[i] >= 20 && buf[i] <= 100 {
 						batVal = int(buf[i])
@@ -288,7 +281,6 @@ func fetchMouseState() MouseState {
 				}
 			}
 
-			// 充电状态位
 			if n > BatteryByteIdx+1 && (buf[BatteryByteIdx+1] == 1 || buf[BatteryByteIdx+1] == 2) {
 				isCharging = true
 			}
