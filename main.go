@@ -16,12 +16,12 @@ import (
 	"gopkg.in/toast.v1"
 )
 
-// 达尔优 AE6 V2 接收器精准硬件参数
+// 达尔优 AE6 V2 硬件参数
 const (
 	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)
 	ProductID       uint16 = 0x1261 // AE6 V2 接收器专属 PID (4705)
 	ReportID        byte   = 0x08   // 通信 Report ID
-	BatteryByteIdx  int    = 18     // 截获配置数组中电量百分比的下标偏移 (第 19 个字节)
+	BatteryByteIdx  int    = 18     // 截获配置数组中电量百分比的下标偏移
 	PollingInterval        = 60 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
@@ -184,18 +184,18 @@ func getBatteryLevel() int {
 	}
 	defer device.Close()
 
-	buf := make([]byte, 192)
-	readBytes, _ := device.ReadTimeout(buf, 80*time.Millisecond)
+	// 发送查询报文触发设备回传数据
+	queryPacket := make([]byte, 65)
+	queryPacket[0] = ReportID
+	_, _ = device.Write(queryPacket)
 
-	if readBytes == 0 {
-		queryPacket := make([]byte, 65)
-		queryPacket[0] = ReportID
-		_, err = device.Write(queryPacket)
-		if err == nil {
-			readBytes, _ = device.ReadTimeout(buf, 100*time.Millisecond)
-		}
+	buf := make([]byte, 192)
+	readBytes, err := device.Read(buf)
+	if err != nil || readBytes == 0 {
+		return -1
 	}
 
+	// 优先检查已抓包确认的第 18 位下标
 	if readBytes > BatteryByteIdx {
 		val := int(buf[BatteryByteIdx])
 		if val >= 0 && val <= 100 {
@@ -203,11 +203,10 @@ func getBatteryLevel() int {
 		}
 	}
 
-	if readBytes > 0 {
-		for i := 0; i < readBytes; i++ {
-			if buf[i] > 0 && buf[i] <= 100 {
-				return int(buf[i])
-			}
+	// 容错匹配
+	for i := 0; i < readBytes; i++ {
+		if buf[i] > 0 && buf[i] <= 100 {
+			return int(buf[i])
 		}
 	}
 
