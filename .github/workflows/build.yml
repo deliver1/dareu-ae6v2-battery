@@ -19,9 +19,16 @@ jobs:
         with:
           go-version: '1.22'
 
+      - name: Download Dependencies
+        run: |
+          go get github.com/getlantern/systray
+          go get github.com/karalabe/hid
+          go get golang.org/x/sys/windows/registry
+          go get gopkg.in/toast.v1
+          go mod tidy
+
       - name: Build Windows Binary
         run: |
-          go mod tidy
           go build -ldflags="-H windowsgui -s -w" -o DareuAE6V2Tray.exe .
 
       - name: Create GitHub Release
