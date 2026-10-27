@@ -9,6 +9,7 @@ import (
 	"image/draw"
 	"image/png"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,15 +17,14 @@ import (
 
 	"github.com/getlantern/systray"
 	"github.com/karalabe/hid"
-	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"gopkg.in/toast.v1"
 )
 
 const (
-	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)[cite: 6]
-	ReportID        byte   = 0x08   // 抓包确认的 ReportID[cite: 4, 6]
-	BatteryByteIdx  int    = 18     // 电量偏移下标[cite: 6]
+	VendorID        uint16 = 0x260D
+	ReportID        byte   = 0x08
+	BatteryByteIdx  int    = 18
 	PollingInterval        = 15 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
@@ -32,8 +32,8 @@ const (
 )
 
 var CandidatePIDs = []uint16{
-	0x1261, // 接收器[cite: 6]
-	0x1260, // 鼠标本体[cite: 6]
+	0x1261,
+	0x1260,
 	0x04ED,
 	0x0260,
 	0x0001,
@@ -69,10 +69,17 @@ func getLog() string {
 }
 
 func main() {
+	defer func() {
+		_ = recover()
+	}()
 	systray.Run(onReady, onExit)
 }
 
 func onReady() {
+	defer func() {
+		_ = recover()
+	}()
+
 	systray.SetTitle("达尔优 AE6 V2")
 	systray.SetIcon(createCleanBatteryIco(-1, false, false))
 	systray.SetTooltip("达尔优 AE6 V2: 正在侦测...")
@@ -82,7 +89,7 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	mDebug = systray.AddMenuItem("排查诊断信息", "点击查看 HID 数据包字节")
+	mDebug = systray.AddMenuItem("导出排查日志到桌面", "生成 dareu_debug.txt 方便查看数据")
 
 	mAutoStart = systray.AddMenuItemCheckbox("开机自启动", "随 Windows 开机启动", isAutoStartEnabled())
 
@@ -100,8 +107,8 @@ func handleMenuEvents() {
 	for {
 		select {
 		case <-mDebug.ClickedCh:
-			msg := getLog()
-			windows.MessageBox(0, windows.StringToUTF16Ptr(msg), windows.StringToUTF16Ptr("达尔优 AE6 V2 检测日志"), windows.MB_OK|windows.MB_ICONINFORMATION)
+			// 点击后在桌面生成一个简单的 txt 文件，绝不调用任何易闪退的弹窗 API
+			go exportDebugFile()
 		case <-mAutoStart.ClickedCh:
 			current := mAutoStart.Checked()
 			if current {
@@ -120,6 +127,18 @@ func handleMenuEvents() {
 	}
 }
 
+func exportDebugFile() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	desktopPath := filepath.Join(home, "Desktop", "dareu_debug.txt")
+	_ = os.WriteFile(desktopPath, []byte(getLog()), 0644)
+
+	// 使用系统自带记事本安全打开
+	_ = exec.Command("notepad.exe", desktopPath).Start()
+}
+
 func pollingLoop() {
 	time.Sleep(500 * time.Millisecond)
 	updateBatteryState()
@@ -133,6 +152,10 @@ func pollingLoop() {
 }
 
 func updateBatteryState() {
+	defer func() {
+		_ = recover()
+	}()
+
 	state := fetchMouseState()
 
 	if state.Connected {
@@ -205,9 +228,12 @@ func setAutoStart(enable bool) error {
 }
 
 func fetchMouseState() MouseState {
+	defer func() {
+		_ = recover()
+	}()
+
 	var matchedDevices []hid.DeviceInfo
 
-	// 1. 枚举所有候选 PID[cite: 4, 6]
 	for _, pid := range CandidatePIDs {
 		devs := hid.Enumerate(VendorID, pid)
 		if len(devs) > 0 {
@@ -215,7 +241,6 @@ func fetchMouseState() MouseState {
 		}
 	}
 
-	// 2. 兜底枚举达尔优设备
 	if len(matchedDevices) == 0 {
 		allDevs := hid.Enumerate(VendorID, 0)
 		for _, d := range allDevs {
@@ -237,15 +262,13 @@ func fetchMouseState() MouseState {
 			continue
 		}
 
-		// 发送达尔优 WebHID 原版握手指令序列[cite: 4]
-		// 指令 A: 握手请求
+		// 发送达尔优 WebHID 原版握手指令序列
 		cmd1 := make([]byte, 65)
-		cmd1[0] = ReportID // Report ID 8[cite: 4]
+		cmd1[0] = ReportID
 		cmd1[1] = 0x08
 		cmd1[2] = 0x02
 		_, _ = dev.Write(cmd1)
 
-		// 指令 B: 查询配置参数 (187 字节长帧触发)[cite: 4, 6]
 		cmd2 := make([]byte, 65)
 		cmd2[0] = ReportID
 		cmd2[1] = 0x03
@@ -254,6 +277,7 @@ func fetchMouseState() MouseState {
 		buf := make([]byte, 256)
 		readCh := make(chan int, 1)
 		go func() {
+			defer func() { _ = recover() }()
 			n, _ := dev.Read(buf)
 			readCh <- n
 		}()
@@ -267,9 +291,8 @@ func fetchMouseState() MouseState {
 		dev.Close()
 
 		if n > 0 {
-			// 格式化输出前 24 字节用于精准定位
 			var hexParts []string
-			limit := 24
+			limit := 32
 			if n < limit {
 				limit = n
 			}
@@ -277,16 +300,14 @@ func fetchMouseState() MouseState {
 				hexParts = append(hexParts, fmt.Sprintf("%02X", buf[i]))
 			}
 			hexStr := strings.Join(hexParts, " ")
-			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X (长%d):\n%s", idx, devInfo.ProductID, n, hexStr))
+			debugLines = append(debugLines, fmt.Sprintf("[%d] PID:0x%04X (长%d): %s", idx, devInfo.ProductID, n, hexStr))
 
 			var batVal int = -1
 			var isCharging bool = false
 
-			// 优先读取 offset 18[cite: 6]
 			if n > BatteryByteIdx && buf[BatteryByteIdx] > 0 && buf[BatteryByteIdx] <= 100 {
 				batVal = int(buf[BatteryByteIdx])
 			} else {
-				// 遍历检索有效电量
 				for i := 1; i < n; i++ {
 					if buf[i] >= 10 && buf[i] <= 100 {
 						batVal = int(buf[i])
@@ -295,7 +316,6 @@ func fetchMouseState() MouseState {
 				}
 			}
 
-			// 充电状态探测
 			if n > BatteryByteIdx+1 && (buf[BatteryByteIdx+1] == 1 || buf[BatteryByteIdx+1] == 2) {
 				isCharging = true
 			}
