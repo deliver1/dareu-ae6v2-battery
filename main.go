@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -22,8 +21,8 @@ import (
 )
 
 const (
-	TargetVID       = "260d" // 达尔优 VID (小写匹配)
-	TargetPID       = "1261" // 接收器 PID
+	TargetVID       = "260d"
+	TargetPID       = "1261"
 	PollingInterval = 4 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
@@ -33,7 +32,6 @@ const (
 var (
 	modhid               = windows.NewLazySystemDLL("hid.dll")
 	procHidD_GetHidGuid  = modhid.NewProc("HidD_GetHidGuid")
-	procHidD_GetAttributes = modhid.NewProc("HidD_GetAttributes")
 
 	modsetupapi                          = windows.NewLazySystemDLL("setupapi.dll")
 	procSetupDiGetClassDevsW             = modsetupapi.NewProc("SetupDiGetClassDevsW")
@@ -41,13 +39,6 @@ var (
 	procSetupDiGetDeviceInterfaceDetailW = modsetupapi.NewProc("SetupDiGetDeviceInterfaceDetailW")
 	procSetupDiDestroyDeviceInfoList     = modsetupapi.NewProc("SetupDiDestroyDeviceInfoList")
 )
-
-type HIDD_ATTRIBUTES struct {
-	Size           uint32
-	VendorID       uint16
-	ProductID      uint16
-	VersionNumber  uint16
-}
 
 type SP_DEVICE_INTERFACE_DATA struct {
 	CbSize             uint32
@@ -212,7 +203,6 @@ func setAutoStart(enable bool) error {
 	return nil
 }
 
-// 纯 Win32 API 遍历所有 HID 设备路径（完全避开 Cgo 崩溃）
 func fetchMouseStateNative() MouseState {
 	var hidGuid windows.GUID
 	procHidD_GetHidGuid.Call(uintptr(unsafe.Pointer(&hidGuid)))
@@ -221,7 +211,7 @@ func fetchMouseStateNative() MouseState {
 		uintptr(unsafe.Pointer(&hidGuid)),
 		0,
 		0,
-		uintptr(0x10|0x02), // DIGCF_DEVICEINTERFACE | DIGCF_PRESENT
+		uintptr(0x10|0x02),
 	)
 	if deviceInfoSet == uintptr(windows.InvalidHandle) {
 		return MouseState{Connected: false}
@@ -259,10 +249,9 @@ func fetchMouseStateNative() MouseState {
 		}
 
 		detailData := make([]byte, requiredSize)
-		// 设置 cbSize 字段 (在 x64 下通常是 8 或 5 字节，标准取 8)
 		*(*uint32)(unsafe.Pointer(&detailData[0])) = 8
 		if unsafe.Sizeof(uintptr(0)) == 4 {
-			*(*uint32)(unsafe.Pointer(&detailData[0])) = 5 // 32位系统
+			*(*uint32)(unsafe.Pointer(&detailData[0])) = 5
 		}
 
 		resDetail, _, _ := procSetupDiGetDeviceInterfaceDetailW.Call(
@@ -277,7 +266,6 @@ func fetchMouseStateNative() MouseState {
 			continue
 		}
 
-		// 提取设备路径字符串
 		pathOffset := 4
 		pathRunes := make([]uint16, 0)
 		for i := pathOffset; i < len(detailData)-1; i += 2 {
@@ -289,10 +277,8 @@ func fetchMouseStateNative() MouseState {
 		}
 		devPath := windows.UTF16ToString(pathRunes)
 
-		// 检查路径是否包含达尔优接收器 VID/PID
 		pathLower := bytes.ToLower([]byte(devPath))
 		if bytes.Contains(pathLower, []byte("vid_260d")) && (bytes.Contains(pathLower, []byte("pid_1261")) || bytes.Contains(pathLower, []byte("pid_1260")) || bytes.Contains(pathLower, []byte("pid_04ed"))) {
-			// 以完全非独占共享模式打开设备
 			h, err := windows.CreateFile(
 				windows.StringToUTF16Ptr(devPath),
 				windows.GENERIC_READ|windows.GENERIC_WRITE,
@@ -303,7 +289,6 @@ func fetchMouseStateNative() MouseState {
 				0,
 			)
 			if err != nil {
-				// 尝试纯只读打开
 				h, err = windows.CreateFile(
 					windows.StringToUTF16Ptr(devPath),
 					windows.GENERIC_READ,
@@ -318,7 +303,6 @@ func fetchMouseStateNative() MouseState {
 				}
 			}
 
-			// 发送 8 号 Report 心跳[cite: 4, 20]
 			cmd := make([]byte, 65)
 			cmd[0] = 0x08
 			cmd[1] = 0x01
@@ -328,7 +312,6 @@ func fetchMouseStateNative() MouseState {
 			buf := make([]byte, 256)
 			var bytesRead uint32
 
-			// 设置短超时异步读取
 			done := make(chan bool, 1)
 			go func() {
 				_ = windows.ReadFile(h, buf, &bytesRead, nil)
@@ -343,10 +326,9 @@ func fetchMouseStateNative() MouseState {
 			windows.CloseHandle(h)
 
 			if bytesRead > 0 {
-				// 检查抓包特征: Data[2]=2 为充满/充电中，或包含大量 0xFF[cite: 20]
 				offset := 0
 				if buf[0] == 0x08 {
-					offset = 0[cite: 20]
+					offset = 0
 				}
 
 				batVal := -1
@@ -354,7 +336,7 @@ func fetchMouseStateNative() MouseState {
 
 				if bytesRead >= 3 && buf[offset+2] == 2 {
 					isCharging = true
-					batVal = 100[cite: 15, 20]
+					batVal = 100
 				}
 
 				if bytesRead >= 10 && buf[offset+5] == 255 && buf[offset+6] == 255 {
