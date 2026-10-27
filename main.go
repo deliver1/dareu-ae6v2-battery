@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -16,16 +18,15 @@ import (
 	"gopkg.in/toast.v1"
 )
 
-// 达尔优 AE6 V2 硬件参数
 const (
-	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)
-	ProductID       uint16 = 0x1261 // AE6 V2 接收器专属 PID (4705)
-	ReportID        byte   = 0x08   // 通信 Report ID
-	BatteryByteIdx  int    = 18     // 截获配置数组中电量百分比的下标偏移
-	PollingInterval        = 60 * time.Second
+	VendorID        uint16 = 0x260D // 达尔优官方 VID (9741)[cite: 6]
+	ProductID       uint16 = 0x1261 // AE6 V2 接收器专属 PID (4705)[cite: 6]
+	ReportID        byte   = 0x08   // 通信 Report ID[cite: 4, 6]
+	BatteryByteIdx  int    = 18     // 电量百分比偏移位[cite: 6]
+	PollingInterval        = 45 * time.Second
 
 	AppName    = "DareuAE6V2Tray"
-	LowBattery = 15 // 低于 15% 触发 Windows 弹窗警告
+	LowBattery = 15
 )
 
 var (
@@ -40,15 +41,17 @@ func main() {
 }
 
 func onReady() {
-	systray.SetTitle("达尔优 AE6 V2 电量")
-	systray.SetTooltip("正在初始化连接...")
+	systray.SetTitle("达尔优 AE6 V2")
+	// 默认先赋予一个显眼的初始图标，防止空白透明
+	systray.SetIcon(createIcoData(100))
+	systray.SetTooltip("达尔优 AE6 V2: 正在连接...")
 
 	mStatus = systray.AddMenuItem("状态: 读取中...", "当前鼠标连接与电量状态")
 	mStatus.Disable()
 
 	systray.AddSeparator()
 
-	mAutoStart = systray.AddMenuItemCheckbox("开机自启动", "勾选后随 Windows 开机静默启动", isAutoStartEnabled())
+	mAutoStart = systray.AddMenuItemCheckbox("开机自启动", "勾选后随系统启动", isAutoStartEnabled())
 
 	systray.AddSeparator()
 
@@ -82,6 +85,8 @@ func handleMenuEvents() {
 }
 
 func pollingLoop() {
+	// 初次启动延时 1 秒，等待系统托盘句柄完全就绪
+	time.Sleep(1 * time.Second)
 	updateBattery()
 
 	ticker := time.NewTicker(PollingInterval)
@@ -98,7 +103,7 @@ func updateBattery() {
 	if battery >= 0 {
 		systray.SetTooltip(fmt.Sprintf("达尔优 AE6 V2: %d%%", battery))
 		mStatus.SetTitle(fmt.Sprintf("当前电量: %d%%", battery))
-		systray.SetIcon(generateBatteryIcon(battery))
+		systray.SetIcon(createIcoData(battery))
 
 		if battery <= LowBattery {
 			if !hasNotified {
@@ -109,9 +114,9 @@ func updateBattery() {
 			hasNotified = false
 		}
 	} else {
-		systray.SetTooltip("达尔优 AE6 V2: 未连接或休眠中")
-		mStatus.SetTitle("状态: 接收器未连接")
-		systray.SetIcon(generateBatteryIcon(-1))
+		systray.SetTooltip("达尔优 AE6 V2: 未连接 (请确认插紧接收器或关闭网页驱动)")
+		mStatus.SetTitle("状态: 接收器未连接/被占用")
+		systray.SetIcon(createIcoData(-1))
 	}
 }
 
@@ -132,10 +137,7 @@ func isAutoStartEnabled() bool {
 	defer k.Close()
 
 	val, _, err := k.GetStringValue(AppName)
-	if err != nil || val == "" {
-		return false
-	}
-	return true
+	return err == nil && val != ""
 }
 
 func setAutoStart(enable bool) error {
@@ -155,92 +157,99 @@ func setAutoStart(enable bool) error {
 			return err
 		}
 		return k.SetStringValue(AppName, fmt.Sprintf("\"%s\"", exePath))
-	} else {
-		_ = k.DeleteValue(AppName)
-		return nil
 	}
+	_ = k.DeleteValue(AppName)
+	return nil
 }
 
+// 遍历枚举并穿透匹配所有接收器接口
 func getBatteryLevel() int {
 	devices := hid.Enumerate(VendorID, ProductID)
 	if len(devices) == 0 {
 		return -1
 	}
 
-	var targetDev *hid.DeviceInfo
-	for _, dev := range devices {
-		if dev.UsagePage != 0x01 {
-			targetDev = &dev
-			break
+	// 逐个遍历接收器公开的所有 HID 接口，跳过被系统锁定的接口
+	for _, devInfo := range devices {
+		dev, err := devInfo.Open()
+		if err != nil {
+			continue // 被占用或独占，尝试下一个
 		}
-	}
-	if targetDev == nil {
-		targetDev = &devices[0]
-	}
 
-	device, err := targetDev.Open()
-	if err != nil {
-		return -1
-	}
-	defer device.Close()
+		// 触发查询
+		query := make([]byte, 65)
+		query[0] = ReportID[cite: 4]
+		_, _ = dev.Write(query)
 
-	// 发送查询报文触发设备回传数据
-	queryPacket := make([]byte, 65)
-	queryPacket[0] = ReportID
-	_, _ = device.Write(queryPacket)
+		buf := make([]byte, 192)
+		// 带超时的非阻塞读取机制
+		readCh := make(chan int, 1)
+		go func() {
+			n, _ := dev.Read(buf)
+			readCh <- n
+		}()
 
-	buf := make([]byte, 192)
-	readBytes, err := device.Read(buf)
-	if err != nil || readBytes == 0 {
-		return -1
-	}
-
-	// 优先检查已抓包确认的第 18 位下标
-	if readBytes > BatteryByteIdx {
-		val := int(buf[BatteryByteIdx])
-		if val >= 0 && val <= 100 {
-			return val
+		var n int
+		select {
+		case n = <-readCh:
+		case <-time.After(120 * time.Millisecond):
+			n = 0
 		}
-	}
 
-	// 容错匹配
-	for i := 0; i < readBytes; i++ {
-		if buf[i] > 0 && buf[i] <= 100 {
-			return int(buf[i])
+		dev.Close()
+
+		if n > 0 {
+			// 1. 检查下标 18[cite: 6]
+			if n > BatteryByteIdx {
+				val := int(buf[BatteryByteIdx])
+				if val > 0 && val <= 100 {
+					return val
+				}
+			}
+			// 2. 检查有效范围
+			for i := 0; i < n; i++ {
+				if buf[i] > 0 && buf[i] <= 100 {
+					return int(buf[i])
+				}
+			}
 		}
 	}
 
 	return -1
 }
 
-func generateBatteryIcon(percent int) []byte {
+// 构建标准 Windows 原生 32x32 ICO 格式二进制数据（彻底解决透明空白图标问题）
+func createIcoData(percent int) []byte {
 	const (
-		width  = 32
-		height = 32
+		w = 32
+		h = 32
 	)
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	m := image.NewRGBA(image.Rect(0, 0, w, h))
 
-	transparent := color.RGBA{0, 0, 0, 0}
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			img.Set(x, y, transparent)
-		}
-	}
+	// 背景保持全透明
+	draw.Draw(m, m.Bounds(), image.Transparent, image.Point{}, draw.Src)
 
-	borderColor := color.RGBA{230, 230, 230, 255}
-	tipColor := color.RGBA{200, 200, 200, 255}
+	// 电池外框与主体（高对比度）
+	bodyBorder := color.RGBA{240, 240, 240, 255}
+	tipColor := color.RGBA{220, 220, 220, 255}
 
-	for x := 3; x <= 27; x++ {
-		img.Set(x, 8, borderColor)
-		img.Set(x, 24, borderColor)
+	// 电池边框 [2, 7] 到 [26, 24]
+	for x := 2; x <= 26; x++ {
+		m.Set(x, 7, bodyBorder)
+		m.Set(x, 8, bodyBorder)
+		m.Set(x, 23, bodyBorder)
+		m.Set(x, 24, bodyBorder)
 	}
-	for y := 8; y <= 24; y++ {
-		img.Set(3, y, borderColor)
-		img.Set(27, y, borderColor)
+	for y := 7; y <= 24; y++ {
+		m.Set(2, y, bodyBorder)
+		m.Set(3, y, bodyBorder)
+		m.Set(25, y, bodyBorder)
+		m.Set(26, y, bodyBorder)
 	}
-	for y := 13; y <= 19; y++ {
-		img.Set(28, y, tipColor)
-		img.Set(29, y, tipColor)
+	// 正极触头
+	for y := 12; y <= 19; y++ {
+		m.Set(27, y, tipColor)
+		m.Set(28, y, tipColor)
 	}
 
 	if percent > 0 {
@@ -248,27 +257,36 @@ func generateBatteryIcon(percent int) []byte {
 		if pct > 100 {
 			pct = 100
 		}
-		var fillColor color.RGBA
+		var fillCol color.RGBA
 		if pct <= 20 {
-			fillColor = color.RGBA{255, 69, 58, 255}
+			fillCol = color.RGBA{255, 59, 48, 255} // 低电亮红
 		} else {
-			fillColor = color.RGBA{48, 209, 88, 255}
+			fillCol = color.RGBA{52, 199, 89, 255} // 正常亮绿
 		}
 
-		fillWidth := int(float64(22) * (float64(pct) / 100.0))
-		for x := 5; x < 5+fillWidth; x++ {
-			for y := 10; y <= 22; y++ {
-				img.Set(x, y, fillColor)
+		fillW := int(float64(20) * (float64(pct) / 100.0))
+		for x := 4; x < 4+fillW; x++ {
+			for y := 10; y <= 21; y++ {
+				m.Set(x, y, fillCol)
 			}
 		}
-	} else if percent == -1 {
-		disconnectColor := color.RGBA{150, 150, 150, 255}
-		for x := 10; x <= 20; x++ {
-			img.Set(x, 16, disconnectColor)
+	} else {
+		// 断开连接：中间亮黄色横杠
+		unColor := color.RGBA{255, 204, 0, 255}
+		for x := 8; x <= 20; x++ {
+			m.Set(x, 15, unColor)
+			m.Set(x, 16, unColor)
 		}
 	}
 
-	var buf bytes.Buffer
-	_ = png.Encode(&buf, img)
-	return buf.Bytes()
-}
+	// 编码为 PNG
+	var pngBuf bytes.Buffer
+	_ = png.Encode(&pngBuf, m)
+	pngBytes := pngBuf.Bytes()
+
+	// 组装标准 22 字节 ICO 头
+	icoBuf := new(bytes.Buffer)
+	// ICONDIR
+	binary.Write(icoBuf, binary.LittleEndian, uint16(0)) // 保留
+	binary.Write(icoBuf, binary.LittleEndian, uint16(1)) // 1 = 图标
+	binary.Write(icoBuf, binary.LittleEndian, uint16(1)) //
