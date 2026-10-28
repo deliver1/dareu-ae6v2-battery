@@ -51,27 +51,22 @@ jobs:
       - name: Build Windows Binary
         shell: powershell
         run: |
-          # 确保入口文件存在：兼容 main.go（历史遗留名）和 my_devices.py
           $entry = "my_devices.py"
           if (-not (Test-Path $entry)) {
-            $entry = "main.go"
-          }
-          if (-not (Test-Path $entry)) {
-            # 如果两个文件都不存在，从当前目录查找第一个 .py 文件
-            $pyFiles = Get-ChildItem -Filter "*.py" -File
-            if ($pyFiles.Count -gt 0) {
-              $entry = $pyFiles[0].Name
+            if (Test-Path "main.go") {
+              $entry = "main.go"
             } else {
-              Write-Error "未找到 Python 入口文件（my_devices.py 或 main.go）"
-              exit 1
+              $pyFiles = Get-ChildItem -Filter "*.py" -File
+              if ($pyFiles.Count -gt 0) {
+                $entry = $pyFiles[0].Name
+              } else {
+                Write-Error "No Python entry file found"
+                exit 1
+              }
             }
           }
-          Write-Host "使用入口文件: $entry"
-
-          pyinstaller --noconfirm --onefile --windowed `
-            --name "DareuAE6V2Tray" `
-            --icon "app.ico" `
-            "$entry"
+          Write-Host "Entry file: $entry"
+          pyinstaller --noconfirm --onefile --windowed --name "DareuAE6V2Tray" --icon "app.ico" $entry
 
       - name: Verify Build Output
         shell: powershell
@@ -79,9 +74,9 @@ jobs:
           $exe = "dist\DareuAE6V2Tray.exe"
           if (Test-Path $exe) {
             $size = (Get-Item $exe).Length
-            Write-Host "构建成功: $exe ($size bytes)"
+            Write-Host "Build OK: $exe ($size bytes)"
           } else {
-            Write-Error "构建失败: 未找到 $exe"
+            Write-Error "Build failed: $exe not found"
             exit 1
           }
 
