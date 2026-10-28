@@ -17,21 +17,17 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          go-version: '1.22'
+          python-version: '3.11'
 
-      - name: Download Dependencies
+      - name: Install PyInstaller
         run: |
-          go get github.com/getlantern/systray
-          go get golang.org/x/sys/windows
-          go get golang.org/x/sys/windows/registry
-          go get gopkg.in/toast.v1
-          go install github.com/akavel/rsrc@latest
-          go mod tidy
+          python -m pip install --upgrade pip
+          pip install pyinstaller
 
-      - name: Generate and Embed Native Icon
+      - name: Generate Native Icon
         shell: powershell
         run: |
           Add-Type -AssemblyName System.Drawing
@@ -51,11 +47,49 @@ jobs:
           $icon.Save($fs)
           $fs.Close()
           $bmp.Dispose()
-          rsrc -ico app.ico -o rsrc.syso
 
       - name: Build Windows Binary
+        shell: powershell
         run: |
-          go build -ldflags="-H windowsgui -s -w" -o DareuAE6V2Tray.exe .
+          # 确保入口文件存在：兼容 main.go（历史遗留名）和 my_devices.py
+          $entry = "my_devices.py"
+          if (-not (Test-Path $entry)) {
+            $entry = "main.go"
+          }
+          if (-not (Test-Path $entry)) {
+            # 如果两个文件都不存在，从当前目录查找第一个 .py 文件
+            $pyFiles = Get-ChildItem -Filter "*.py" -File
+            if ($pyFiles.Count -gt 0) {
+              $entry = $pyFiles[0].Name
+            } else {
+              Write-Error "未找到 Python 入口文件（my_devices.py 或 main.go）"
+              exit 1
+            }
+          }
+          Write-Host "使用入口文件: $entry"
+
+          pyinstaller --noconfirm --onefile --windowed `
+            --name "DareuAE6V2Tray" `
+            --icon "app.ico" `
+            "$entry"
+
+      - name: Verify Build Output
+        shell: powershell
+        run: |
+          $exe = "dist\DareuAE6V2Tray.exe"
+          if (Test-Path $exe) {
+            $size = (Get-Item $exe).Length
+            Write-Host "构建成功: $exe ($size bytes)"
+          } else {
+            Write-Error "构建失败: 未找到 $exe"
+            exit 1
+          }
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DareuAE6V2Tray-windows
+          path: dist/DareuAE6V2Tray.exe
 
       - name: Generate Release Tag
         id: tag
@@ -74,8 +108,10 @@ jobs:
           name: "达尔优 AE6 V2 托盘助手 ${{ steps.tag.outputs.release_tag }}"
           body: |
             ### 达尔优 AE6 V2 电量监控小工具
-            - 彻底剔除 karalabe/hid C 依赖，改用纯 Win32 API 原生驱动，彻底杜绝闪退。
-            - 针对 16 字节短报文与 100% 满电精确匹配[cite: 15, 20]。
-          files: DareuAE6V2Tray.exe
+            - 纯 Python + ctypes + tkinter，零第三方运行时依赖
+            - 支持 达尔优 AE6 V2 鼠标 + Xbox 360 手柄 双设备电量监控
+            - 修复了函数名不匹配导致鼠标永远无法读取的 bug
+            - 补全了 XInput / GDI 函数的 64 位类型安全声明
+          files: dist/DareuAE6V2Tray.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
